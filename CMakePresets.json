@@ -1,0 +1,71 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "windows-base",
+            "hidden": true,
+            "generator": "Ninja Multi-Config",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "win-x64",
+            "inherits": "windows-base",
+            "displayName": "Windows x64 (MSVC)",
+            "description": "Build Goof Troop Boop for Windows x64 using MSVC",
+            "architecture": {
+                "value": "x64",
+                "strategy": "external"
+            },
+            "environment": {
+                "CFLAGS": "/permissive- /Zc:strictStrings- /W3 -DNOMINMAX -D_CRT_SECURE_NO_DEPRECATE -D_CRT_NONSTDC_NO_DEPRECATE -D_USE_MATH_DEFINES",
+                "CXXFLAGS": "/permissive- /Zc:strictStrings- /W3 -DNOMINMAX -D_CRT_SECURE_NO_DEPRECATE -D_CRT_NONSTDC_NO_DEPRECATE -D_USE_MATH_DEFINES"
+            }
+        },
+        {
+            "name": "win-x64-clang",
+            "inherits": "windows-base",
+            "displayName": "Windows x64 (Clang)",
+            "description": "Build Goof Troop Boop for Windows x64 using Clang",
+            "environment": {
+                "CFLAGS": "--target=x86_64-pc-windows-msvc -fuse-ld=lld /permissive- /W3 -DNOMINMAX -D_CRT_SECURE_NO_DEPRECATE -D_CRT_NONSTDC_NO_DEPRECATE -D_USE_MATH_DEFINES",
+                "CXXFLAGS": "--target=x86_64-pc-windows-msvc -fuse-ld=lld /permissive- /W3 -DNOMINMAX -D_CRT_SECURE_NO_DEPRECATE -D_CRT_NONSTDC_NO_DEPRECATE -D_USE_MATH_DEFINES"
+            },
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang-cl.exe",
+                "CMAKE_CXX_COMPILER": "clang-cl.exe",
+                "WITH_LZMA_ASM": false
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "win-x64-debug",
+            "displayName": "Windows x64, Debug",
+            "configurePreset": "win-x64",
+            "configuration": "Debug"
+        },
+        {
+            "name": "win-x64-release",
+            "displayName": "Windows x64, Release",
+            "configurePreset": "win-x64",
+            "configuration": "Release"
+        },
+        {
+            "name": "win-x64-clang-debug",
+            "displayName": "Windows x64, Debug (Clang)",
+            "configurePreset": "win-x64-clang",
+            "configuration": "Debug"
+        },
+        {
+            "name": "win-x64-clang-release",
+            "displayName": "Windows x64, Release (Clang)",
+            "configurePreset": "win-x64-clang",
+            "configuration": "Release"
+        }
+    ]
+}

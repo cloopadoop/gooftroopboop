@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "submodules": [
+    {
+      "path": "lib/spdlog",
+      "url": "https://github.com/gabime/spdlog.git",
+      "commit": "6fa36017cfd5731d617e1a934f0e5ea9c4445b13"
+    },
+    {
+      "path": "lib/zlib",
+      "url": "https://github.com/madler/zlib.git",
+      "commit": "5a82f71ed1dfc0bec044d9702463dbdf84ea3b71"
+    }
+  ]
+}

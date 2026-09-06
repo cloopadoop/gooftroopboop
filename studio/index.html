@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="/brand.png" />
+    <title>Goof Troop Boop</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <img class="brand-mark" src="/brand.png" alt="">
+          <span class="brand-name">Goof Troop <b>Boop</b></span>
+        </div>
+        <div class="filemenu">
+          <div class="menu-wrap">
+            <button id="btn-file" class="text-btn" title="File menu">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" style="vertical-align:-3px"><path d="M3 6h18v2H3zM3 11h18v2H3zM3 16h18v2H3z"/></svg>
+            </button>
+            <div class="menu file-menu" id="menu-file">
+              <button data-act="new">New</button>
+              <button data-act="open">Open…</button>
+              <button data-act="save">Save Session…</button>
+              <div class="menu-sep"></div>
+              <div class="menu-label">Import</div>
+              <button data-imp="spc">SPC…</button>
+              <button data-imp="asm">ASM…</button>
+              <button data-imp="midi">MIDI…</button>
+              <button data-imp="rom">From ROM…</button>
+              <div class="menu-sep"></div>
+              <div class="menu-label">Export</div>
+              <button data-exp="spc">SPC…</button>
+              <button data-exp="asm">ASM…</button>
+              <button data-exp="midi">MIDI…</button>
+              <button data-exp="rom">Into ROM…</button>
+              <button data-exp="wav">WAV…</button>
+              <button data-exp="mp3">MP3…</button>
+              <div class="menu-sep"></div>
+              <button data-act="quit">Quit</button>
+            </div>
+          </div>
+        </div>
+        <div class="song-title" id="song-title">No song loaded</div>
+        <div class="transport">
+          <button id="btn-undo" class="icon-btn" title="Undo (Ctrl+Z)">↶</button>
+          <button id="btn-redo" class="icon-btn" title="Redo (Ctrl+Y)">↷</button>
+          <span class="sep"></span>
+          <button id="btn-play" class="icon-btn play" title="Play / Pause (Space)">▶</button>
+          <button id="btn-stop" class="icon-btn" title="Stop">■</button>
+          <button id="btn-loop" class="icon-btn" title="Loop">⟳</button>
+          <span class="time" id="time">0:00 / 0:00</span>
+          <span class="sep"></span>
+          <button id="btn-add" class="icon-btn" title="Add-note mode (A)"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M17.7 2.3a1 1 0 0 1 1.4 0l2.6 2.6a1 1 0 0 1 0 1.4L9.4 18.6a1 1 0 0 1-.45.26l-4.2 1.2a.75.75 0 0 1-.93-.93l1.2-4.2a1 1 0 0 1 .26-.45L17.7 2.3zM15.3 6.1l2.6 2.6 1.7-1.7-2.6-2.6-1.7 1.7zM6.6 14.8l-.8 2.8 2.8-.8 7.9-7.9-2-2-7.9 7.9z"/></svg></button>
+          <button id="btn-tracker" class="icon-btn" title="Tracker view (T)">☰</button>
+          <button id="btn-zoomin" class="icon-btn" title="Zoom in (Ctrl+=)">+</button>
+          <button id="btn-zoomout" class="icon-btn" title="Zoom out (Ctrl+-)">−</button>
+          <button id="btn-eyedrop" class="icon-btn" title="Match instrument: select notes, click this, then click a source note"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.7 3.3a2.4 2.4 0 0 0-3.4 0l-2.8 2.8-.95-.95a1 1 0 1 0-1.4 1.4l.25.25-7.6 7.6a2 2 0 0 0-.52.9L3 19.4a1.2 1.2 0 0 0 1.5 1.5l4.1-1.2a2 2 0 0 0 .9-.52l7.6-7.6.25.25a1 1 0 0 0 1.4-1.4l-.95-.95 2.8-2.8a2.4 2.4 0 0 0 0-3.4zM8.2 17.9l-2.9.85.85-2.9 7.3-7.3 2.05 2.05-7.3 7.3z"/></svg></button>
+          <button id="btn-optimize" class="icon-btn" title="Reclaim song bytes (merge rests, drop duplicate settings)"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l1.3 3.9L17 7.2l-3.7 1.3L12 12.4l-1.3-3.9L7 7.2l3.7-1.3L12 2zM5.5 12.5l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6zM18 13.5l1 2.75 2.75 1-2.75 1-1 2.75-1-2.75-2.75-1 2.75-1 1-2.75z"/></svg></button>
+        </div>
+        <div class="budget" id="budget" title="Song size vs its ARAM allocation"></div>
+      </header>
+
+      <div class="scrub"><input type="range" id="seek" min="0" max="1000" value="0" step="1" /></div>
+
+      <main class="workspace">
+        <aside class="channels" id="channels"></aside>
+        <section class="roll-wrap">
+          <canvas id="roll"></canvas>
+          <div id="tracker" class="tracker" hidden></div>
+        </section>
+        <div class="splitter" id="splitter" title="Drag to resize panel"></div>
+        <aside class="inspector" id="inspector">
+          <div class="inspector-empty">Select a note to edit</div>
+        </aside>
+      </main>
+      <footer class="statusbar" id="status">Ready</footer>
+    </div>
+    <div class="modal-back" id="modal-back"><div class="modal" id="modal"></div></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
