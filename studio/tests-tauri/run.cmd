@@ -29,9 +29,12 @@ if not exist "%TEST_VENV%\Scripts\python.exe" (
 call "%TEST_VENV%\Scripts\python.exe" -c "import selenium; assert selenium.__version__ == '4.48.0'" >nul 2>&1 || (
   call "%TEST_VENV%\Scripts\python.exe" -m pip install --disable-pip-version-check -r tests-tauri\requirements.txt || exit /b 1
 )
+if defined GTB_TEST_APP goto test
 call "%TEST_VENV%\Scripts\python.exe" tests-tauri\sync_engine.py || exit /b 1
 set "TEST_BUILD_ARGS=--debug --no-bundle"
 if "%GTB_TEST_RELEASE%"=="1" set "TEST_BUILD_ARGS=--no-bundle"
 call npm run tauri build -- %TEST_BUILD_ARGS% || exit /b 1
+:test
+call "%TEST_VENV%\Scripts\python.exe" tests-tauri\ownership_regression.py || exit /b 1
 call "%TEST_VENV%\Scripts\python.exe" -m unittest discover -s tests-tauri -p "test_*.py" -v
 exit /b %ERRORLEVEL%

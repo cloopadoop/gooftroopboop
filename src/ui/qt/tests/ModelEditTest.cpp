@@ -97,6 +97,42 @@ struct Stats {
   int resize = 0, insert = 0, move = 0, instr = 0, erase = 0, setting = 0, loop = 0, undo = 0;
 };
 
+class LegacyTrackProbe : public CapcomSnesTrack {
+ public:
+  using CapcomSnesTrack::CapcomSnesTrack;
+  uint32_t position() const { return curOffset; }
+};
+
+int TestLegacyNoOps() {
+  int cases = 0;
+  for (auto version : {CAPCOMSNES_V1_BGM_IN_LIST, CAPCOMSNES_V2_BGM_USUALLY_AT_FIXED_LOCATION,
+                       CAPCOMSNES_V3_BGM_FIXED_LOCATION}) {
+    for (uint8_t opcode : {0x1e, 0x1f}) {
+      for (uint8_t operand : {0, 8, 0x0e, 0x16, 0x17, 0x18, 0x61, 0xff}) {
+        std::vector<uint8_t> bytes{opcode, operand, 0x17};
+        VirtFile raw(bytes.data(), static_cast<uint32_t>(bytes.size()), "synthetic-noop");
+        CapcomSnesSeq seq(&raw, version, 0, false);
+        const auto expected = version == CAPCOMSNES_V1_BGM_IN_LIST ? EVENT_UNKNOWN1 : EVENT_NOP;
+        if (seq.EventMap.at(opcode) != expected) {
+          std::fprintf(stderr, "FAIL legacy opcode family classification\n");
+          return 1;
+        }
+        LegacyTrackProbe track(&seq, 0);
+        track.readMode = READMODE_ADD_TO_UI;
+        track.loadTrackInit(0, nullptr);
+        if (!track.readEvent() || track.position() != 2 || track.readEvent() || track.position() != 3) {
+          std::fprintf(stderr, "FAIL legacy NOP version=%u opcode=%u operand=%u\n",
+                       static_cast<unsigned>(version), opcode, operand);
+          return 1;
+        }
+        ++cases;
+      }
+    }
+  }
+  std::printf("PASS legacy operand consumption and V1 versus V2/V3 classification: %d cases\n", cases);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -104,6 +140,9 @@ int main(int argc, char* argv[]) {
 
   static TestRoot testRoot;
   pRoot = &testRoot;
+  if (argc == 2 && std::string(argv[1]) == "--legacy-noops") {
+    return TestLegacyNoOps();
+  }
 
   std::filesystem::path inputPath;
   uint32_t base = 0x0D20;

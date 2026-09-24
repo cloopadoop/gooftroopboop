@@ -22,6 +22,14 @@ project(
 
 add_compile_definitions(NOMINMAX)
 
+# Keep build-machine paths out of shipped binaries: __FILE__ (asserts and log
+# locations in the engine and vendored C libraries) is made relative to the
+# source tree instead of embedding the absolute checkout path.
+if(MSVC)
+  file(TO_NATIVE_PATH "${CMAKE_SOURCE_DIR}/" GTB_NATIVE_SOURCE_DIR)
+  add_compile_options("/d1trimfile:${GTB_NATIVE_SOURCE_DIR}")
+endif()
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 find_package(Git)

@@ -21,6 +21,9 @@ export interface SongState {
   source: string; writable: boolean; canUndo: boolean; canRedo: boolean;
   programs: Program[]; budget?: { used: number; total: number }; tracks: Track[];
   tempoBpm?: number; ppqn?: number;
+  // Tempo changes over the song, sorted by tick, first entry at tick 0. Older
+  // engines omit it; tempoBpm then applies to the whole song.
+  tempoMap?: { tick: number; bpm: number }[];
 }
 
 export interface RomSlot { slot: number; size: number; }
@@ -34,7 +37,9 @@ export interface Engine {
   renderNote(track: number, note: number): Promise<string | null>;
   // Raw request without state-refresh semantics (import/export commands).
   request(cmd: string, params?: Record<string, unknown>): Promise<Record<string, unknown>>;
-  onEngineRestart: (() => Promise<void>) | null;
+  // Called with the failed command after the sidecar died and the Rust shell
+  // will start a fresh (empty) one: reload the song or throw to explain why not.
+  onEngineRestart: ((cmd: string) => Promise<void>) | null;
   listRomSongs(path: string): Promise<RomSlot[]>;
   wavUrl(path: string): string;
   openDialog(filters?: { name: string; extensions: string[] }[]): Promise<string | null>;
@@ -45,21 +50,73 @@ export interface Engine {
 const tauri = (window as any).__TAURI__;
 
 async function invoke(request: Record<string, unknown>): Promise<any> {
-  return tauri.core.invoke("engine_request", { request });
+  try {
+    return await tauri.core.invoke("engine_request", { request });
+  } catch (err) {
+    // Tauri rejects with the Rust error string; normalize to Error.
+    throw err instanceof Error ? err : new Error(String(err));
+  }
 }
+
+// The Rust shell prefixes transport failures with this once it has dropped the
+// dead sidecar; the next request goes to a fresh engine with no song loaded.
+export const ENGINE_RESTARTED = "engine restarted";
+export function isEngineRestart(err: unknown): boolean {
+  return (err instanceof Error ? err.message : String(err)).startsWith(ENGINE_RESTARTED);
+}
+// Commands that load a whole new song: on a fresh engine they simply retry.
+const LOADS_SONG = new Set(["open", "openSession", "openRom", "new", "importMidi", "importAsm"]);
+// Commands that never touch the open song.
+const SONG_FREE = new Set(["listRomSongs", "inspectAsm", "inspectAsmRepair"]);
 
 export class TauriEngine implements Engine {
   readonly readOnly = false;
   readonly canPlay = true;
+  // Set when a restart lost the in-memory song and it could not be reloaded:
+  // song commands fail with this plain explanation until a song is loaded,
+  // instead of the fresh engine's bare "no song open".
+  private songLost: string | null = null;
 
   async open(path: string): Promise<SongState> {
     // Empty path = engine opens its bundled default soundbank song.
     return this.send("open", { path });
   }
   async send(cmd: string, params: Record<string, unknown> = {}): Promise<SongState> {
-    const resp = await invoke({ cmd, ...params });
+    const resp = await this.call(cmd, params);
     if (!resp.ok) throw new Error(resp.error || "engine error");
     return resp.state as SongState;
+  }
+
+  // Every engine command goes through here so a crashed sidecar is recovered
+  // (at most one retry) no matter which entry point hit it.
+  private async call(cmd: string, params: Record<string, unknown>): Promise<any> {
+    const needsSong = !LOADS_SONG.has(cmd) && !SONG_FREE.has(cmd);
+    if (needsSong && this.songLost) throw new Error(this.songLost);
+    let resp;
+    try {
+      resp = await invoke({ cmd, ...params });
+    } catch (err) {
+      if (!isEngineRestart(err)) throw err;
+      if (needsSong) {
+        try {
+          if (!this.onEngineRestart) throw new Error("The audio engine restarted and the song in memory was lost. Reopen a saved file or start a new song.");
+          await this.onEngineRestart(cmd);
+        } catch (why) {
+          this.songLost = (why as Error).message;
+          throw why;
+        }
+      }
+      try {
+        resp = await invoke({ cmd, ...params });
+      } catch (again) {
+        if (needsSong && isEngineRestart(again)) {
+          this.songLost = "The audio engine stopped again right after restarting. Reopen the song to continue.";
+        }
+        throw again;
+      }
+    }
+    if (LOADS_SONG.has(cmd) && resp?.ok) this.songLost = null;
+    return resp;
   }
   // Cache-bust: render outputs reuse the same temp filename, and the webview
   // caches asset URLs — without the query param every preview replays stale audio.
@@ -67,33 +124,22 @@ export class TauriEngine implements Engine {
     return tauri.core.convertFileSrc(path) + "?v=" + Date.now();
   }
   async render(seconds: number, mute: number[]): Promise<string | null> {
-    const resp = await invoke({ cmd: "render", seconds, mute });
+    const resp = await this.call("render", { seconds, mute });
     if (!resp.ok) throw new Error(resp.error || "render failed");
     return this.fileUrl(resp.wav);
   }
   async renderNote(track: number, note: number): Promise<string | null> {
-    const resp = await invoke({ cmd: "renderNote", track, note });
+    const resp = await this.call("renderNote", { track, note });
     if (!resp.ok) return null;
     return this.fileUrl(resp.wav);
   }
   wavUrl(path: string): string { return this.fileUrl(path); }
   // Set by main.ts: reopen the current song after the sidecar dies and the
   // Rust shell respawns it (the fresh process has no song loaded).
-  onEngineRestart: (() => Promise<void>) | null = null;
+  onEngineRestart: ((cmd: string) => Promise<void>) | null = null;
 
   async request(cmd: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
-    let resp;
-    try {
-      resp = await invoke({ cmd, ...params });
-    } catch (err) {
-      const msg = String(err);
-      if (this.onEngineRestart && /pipe|stdin|engine|died|closed|broken/i.test(msg)) {
-        await this.onEngineRestart();
-        resp = await invoke({ cmd, ...params });
-      } else {
-        throw err instanceof Error ? err : new Error(msg);
-      }
-    }
+    const resp = await this.call(cmd, params);
     if (!resp.ok) throw new Error(resp.error || cmd + " failed");
     return resp;
   }
@@ -132,7 +178,7 @@ export class StaticEngine implements Engine {
   }
   async render(): Promise<string | null> { return null; }
   async renderNote(): Promise<string | null> { return null; }
-  onEngineRestart: (() => Promise<void>) | null = null;
+  onEngineRestart: ((cmd: string) => Promise<void>) | null = null;
   async request(): Promise<Record<string, unknown>> { throw new Error("not available in preview"); }
   async listRomSongs(): Promise<RomSlot[]> { return []; }
   wavUrl(path: string): string { return path; }

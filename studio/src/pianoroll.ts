@@ -9,9 +9,45 @@ const KEY_W = 66;
 const HEADER_H = 26;
 const SCROLL_H = 14;  // bottom overview strip: song minimap + viewport thumb
 const MIN_PITCH = 12;
+// Position grid for add/move/resize, chosen in the toolbar. 1 requests exact
+// ticks (the engine rejects gaps it cannot encode); coarser grids land on
+// encodable positions far more often.
+export const SNAP_CHOICES = [1, 3, 6, 12, 24, 48] as const;
+export const DEFAULT_SNAP = 3;
+
+// Notes are addressed by their index in the engine's per-track list (rests
+// included), which shifts whenever an earlier event changes. A key names the
+// note itself so selections can be re-found in the next state.
+export interface NoteRef { track: number; note: number; }
+export interface NoteKey { track: number; tick: number; pitch: number; rest: boolean; program: number; }
+export function noteKeyOf(s: SongState | null, ref: NoteRef): NoteKey | null {
+  const n = s?.tracks.find((t) => t.index === ref.track)?.notes.find((x) => x.i === ref.note);
+  return n ? { track: ref.track, tick: n.tick, pitch: n.pitch, rest: n.rest, program: n.program } : null;
+}
+export function findNoteByKey(s: SongState | null, k: NoteKey): NoteRef | null {
+  const tr = s?.tracks.find((t) => t.index === k.track);
+  const hits = tr?.notes.filter((n) => n.tick === k.tick && n.rest === k.rest && (k.rest || n.pitch === k.pitch)) ?? [];
+  const n = hits.find((x) => x.program === k.program) ?? hits[0];
+  return n ? { track: k.track, note: n.i } : null;
+}
+// Re-find a ref from `prev` in `next`; `follow` gives where the note is
+// expected to be after an edit that moved it (tried before its old place).
+export function remapRef(prev: SongState | null, next: SongState | null, ref: NoteRef,
+  follow?: ((k: NoteKey) => NoteKey) | null): NoteRef | null {
+  const k = noteKeyOf(prev, ref);
+  if (!k) return null;
+  return (follow ? findNoteByKey(next, follow(k)) : null) ?? findNoteByKey(next, k);
+}
+// Capcom lenIndex 1..7: dotted scales even lengths below 128 by 3/2.
+export const NOTE_LENGTHS = [2, 3, 4, 6, 8, 9, 12, 16, 18, 24, 32, 36, 48, 64, 72, 96, 128, 144, 192];
+export function quantizeNoteLength(ticks: number, lengths: readonly number[] = NOTE_LENGTHS): number {
+  const requested = Number.isFinite(ticks) ? ticks : 24;
+  return lengths.reduce((best, value) => Math.abs(value - requested) < Math.abs(best - requested) ? value : best);
+}
 const MAX_PITCH = 108;
 
 export interface RollCallbacks {
+  onTimingFeedback?(message: string): void;
   onSelectNote(track: number, note: number): void;
   onAddNote(track: number, tick: number, pitch: number, len: number): void;
   onMoveNote(track: number, note: number, tick: number, pitch: number): void;
@@ -35,7 +71,9 @@ export class PianoRoll {
   private state: SongState | null = null;
   private activeTrack = 0;
   private hidden = new Set<number>();
-  private selected: { track: number; note: number } | null = null;
+  private selected: NoteRef | null = null;
+  private follow: ((k: NoteKey) => NoteKey) | null = null;
+  private snap = DEFAULT_SNAP;
   private hits: Hit[] = [];
   private scrollX = 0;
   private scrollY = 0;
@@ -51,7 +89,7 @@ export class PianoRoll {
   private loopDrag: { startTick: number; curTick: number } | null = null;
   // drag on empty grid sweeps out a marquee; the notes inside become a group
   private marquee: { x0: number; y0: number; x1: number; y1: number } | null = null;
-  private multiSel: { track: number; note: number }[] = [];
+  private multiSel: NoteRef[] = [];
   // dragging the bottom overview strip pans the viewport
   private scrollbarDrag = false;
   // meta lanes under the ruler: collapsible, scroll/zoom-synced
@@ -60,8 +98,24 @@ export class PianoRoll {
   private loopEdgeDrag: { loop: number; edge: "start" | "end"; curX: number } | null = null;
   // ghost of the note being dragged, at its would-be drop position
   private dragGhost: { tick: number; pitch: number; len: number } | null = null;
+  private timingFeedback = "";
+
+  private previewLength(requested: number, note?: Note): number {
+    const context = note as (Note & { timingLengths?: number[] }) | undefined;
+    const lengths = context?.timingLengths?.length ? context.timingLengths : NOTE_LENGTHS;
+    const len = quantizeNoteLength(requested, lengths);
+    const raw = Math.round(requested);
+    const message = raw === len ? `${len} ticks; placement must fit available timing`
+      : `${raw} ticks → ${len} ticks (quantized); placement must fit available timing`;
+    if (message !== this.timingFeedback) {
+      this.timingFeedback = message;
+      this.canvas.title = message;
+      this.cb.onTimingFeedback?.(message);
+    }
+    return len;
+  }
   // add-mode: drag out the new note's length before committing it
-  private addDrag: { track: number; tick: number; pitch: number } | null = null;
+  private addDrag: { track: number; tick: number; pitch: number; startX: number; sizing: boolean } | null = null;
   private glissando = false;
   private lastGlissPitch = -1;
   // clickable setting markers (tempo/lfo/echo triangles on the ruler)
@@ -88,13 +142,34 @@ export class PianoRoll {
   }
 
   setState(s: SongState, activeTrack: number, hidden: Set<number>) {
+    const prev = this.state;
     this.state = s; this.activeTrack = activeTrack; this.hidden = hidden;
+    if (prev && prev !== s) this.remapSelection(prev, s);
     this.resize();
+  }
+  // The next state comes from an edit that moved the selected notes: look for
+  // them at their new place first (consumed by the next setState).
+  followEdit(follow: (k: NoteKey) => NoteKey) { this.follow = follow; }
+  setSnap(ticks: number) { this.snap = Math.max(1, Math.round(ticks)); }
+  getSnap(): number { return this.snap; }
+  private snapTick(t: number): number { return Math.max(0, Math.round(t / this.snap) * this.snap); }
+  private remapSelection(prev: SongState, next: SongState) {
+    const follow = this.follow; this.follow = null;
+    const map = (r: NoteRef) => remapRef(prev, next, r, follow);
+    this.selected = this.selected ? map(this.selected) : null;
+    this.multiSel = this.multiSel.map(map).filter((r): r is NoteRef => !!r);
+    if (this.drag) {
+      // a state landed mid-drag: keep dragging the same note, or drop the drag
+      const r = map({ track: this.drag.track, note: this.drag.note.i });
+      const n = r && next.tracks.find((t) => t.index === r.track)?.notes.find((x) => x.i === r.note);
+      if (r && n) { this.drag.note = n; this.drag.track = r.track; }
+      else { this.drag = null; this.dragGhost = null; }
+    }
   }
   setSelected(track: number, note: number) { this.selected = { track, note }; this.draw(); }
   clearSelection() { this.selected = null; this.multiSel = []; this.selLoop = null; this.draw(); }
   // marquee group refs if present, else the single selected note ref
-  getSelectedRefs(): { track: number; note: number }[] {
+  getSelectedRefs(): NoteRef[] {
     return this.multiSel.length ? [...this.multiSel] : (this.selected ? [this.selected] : []);
   }
   // marquee group if present, else the single selected note
@@ -294,9 +369,9 @@ export class PianoRoll {
       this.draw();
     } else if (this.addMode) {
       // press starts the note; dragging right sets its length (mouseup commits)
-      const tick = Math.round(this.tickForX(x) / 12) * 12;
+      const tick = this.snapTick(this.tickForX(x));
       const pitch = clamp(this.pitchForY(y), 0, 127);
-      this.addDrag = { track: this.activeTrack, tick, pitch };
+      this.addDrag = { track: this.activeTrack, tick, pitch, startX: x, sizing: false };
       this.dragGhost = { tick, pitch, len: 24 };
       this.draw();
     } else {
@@ -329,8 +404,13 @@ export class PianoRoll {
       return;
     }
     if (this.addDrag) {
-      const raw = Math.round((this.tickForX(x) - this.addDrag.tick) / 6) * 6;
-      const len = isFinite(raw) ? Math.max(6, raw) : 24;
+      // Only start length-sizing after a real horizontal drag; a plain click
+      // (with mouse jitter) keeps the default note length instead of snapping
+      // to the minimum.
+      if (!this.addDrag.sizing && Math.abs(x - this.addDrag.startX) < 8) return;
+      this.addDrag.sizing = true;
+      const raw = Math.round((this.tickForX(x) - this.addDrag.tick) / this.snap) * this.snap;
+      const len = this.previewLength(raw);
       this.dragGhost = { tick: this.addDrag.tick, pitch: this.addDrag.pitch, len };
       this.draw();
       return;
@@ -351,10 +431,16 @@ export class PianoRoll {
       return;
     }
     if (Math.abs(x - this.drag.startX) > 3 || Math.abs(y - this.drag.startY) > 3) this.drag.moved = true;
+    if (this.drag.moved && this.drag.mode === "resize" && !this.drag.note.rest) {
+      const n = this.drag.note;
+      this.dragGhost = { tick: n.tick, pitch: n.pitch, len: this.previewLength(this.snapTick(this.tickForX(x)) - n.tick, n) };
+      this.draw();
+      return;
+    }
     if (this.drag.moved && this.drag.mode === "move" && !this.drag.note.rest) {
       // ghost the would-be drop position; sound it when the pitch changes
       const d = this.drag;
-      const tick = Math.max(0, Math.round(this.tickForX(x - (d.startX - this.xForTick(d.note.tick))) / 12) * 12);
+      const tick = this.snapTick(this.tickForX(x - (d.startX - this.xForTick(d.note.tick))));
       const pitch = clamp(this.pitchForY(y), 0, 127);
       if (!this.dragGhost || this.dragGhost.tick !== tick || this.dragGhost.pitch !== pitch) {
         if (this.dragGhost?.pitch !== pitch) this.cb.onDragPreview(d.track, pitch);
@@ -425,12 +511,12 @@ export class PianoRoll {
     if (!d.moved || d.note.rest) { this.draw(); return; }
     const { x, y } = this.localXY(e);
     if (d.mode === "resize") {
-      const endTick = this.tickForX(x);
-      const len = Math.max(1, Math.round((endTick - d.note.tick) / 6) * 6);
+      const endTick = this.snapTick(this.tickForX(x));
+      const len = this.previewLength(endTick - d.note.tick, d.note);
       if (len !== d.note.len) this.cb.onResizeNote(d.track, d.note.i, len);
       return;
     }
-    const tick = Math.max(0, Math.round(this.tickForX(x - (d.startX - this.xForTick(d.note.tick))) / 12) * 12);
+    const tick = this.snapTick(this.tickForX(x - (d.startX - this.xForTick(d.note.tick))));
     const pitch = clamp(this.pitchForY(y), 0, 127);
     if (d.group && this.multiSel.length > 1) {
       // move the whole marquee group by the same delta
@@ -443,7 +529,7 @@ export class PianoRoll {
         const n = tr?.notes.find((nn) => nn.i === s.note);
         if (n && !n.rest) items.push({ track: s.track, tick: n.tick, pitch: n.pitch });
       }
-      this.multiSel = [];
+      // the group stays selected: main follows it to the new place on success
       this.cb.onMoveNotes(items, dTick, dPitch);
       return;
     }
@@ -573,6 +659,9 @@ export class PianoRoll {
       ctx.stroke();
       ctx.setLineDash([]);
       ctx.globalAlpha = 1;
+      ctx.fillStyle = "#fff";
+      ctx.font = "11px sans-serif";
+      ctx.fillText(`${g.len} ticks (requested)`, Math.max(KEY_W + 4, gx), Math.max(this.gridTop() + 12, gy - 4));
     }
 
     // rejected edits: red dashed outlines with an X, hover shows the reason

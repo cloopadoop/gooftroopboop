@@ -2,6 +2,17 @@
 import ctypes
 from ctypes import wintypes
 import time
+import json
+import subprocess
+
+
+def processes():
+    result = subprocess.run(["powershell", "-NoProfile", "-Command",
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,"
+        "@{Name='CreationTime';Expression={if ($_.CreationDate) {$_.CreationDate.ToFileTimeUtc()} else {0}}}"
+        " | ConvertTo-Json -Compress"],
+        capture_output=True, text=True, check=True)
+    return json.loads(result.stdout)
 
 USER = ctypes.WinDLL("user32", use_last_error=True)
 CALLBACK = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -26,7 +37,7 @@ def windows(pid, class_name=None, title_contains=None):
         USER.GetClassNameW(hwnd, name, 256)
         title = ctypes.create_unicode_buffer(512)
         USER.GetWindowTextW(hwnd, title, 512)
-        if (owner.value == pid and USER.IsWindowVisible(hwnd)
+        if ((pid is None or owner.value == pid) and USER.IsWindowVisible(hwnd)
                 and (class_name is None or name.value == class_name)
                 and (title_contains is None or title_contains in title.value)):
             result.append(hwnd)
@@ -82,5 +93,38 @@ def process_alive(pid):
         return False
     try:
         return kernel.WaitForSingleObject(handle, 0) == 0x102
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def terminate_verified(expected):
+    """Fault injection into one verified process handle; never a PID tree."""
+    from process_ownership import require_same_identity
+    if expected is None or not 0 < expected[0] <= 0xffffffff:
+        raise RuntimeError('Missing fault-injection process identity')
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                               wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel.OpenProcess(0x00101001, False, expected[0])
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel.GetProcessTimes(handle, *(ctypes.byref(value) for value in times)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        size = wintypes.DWORD(32768)
+        path = ctypes.create_unicode_buffer(size.value)
+        if not kernel.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        created = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        require_same_identity(expected, dict(ProcessId=expected[0], CreationTime=created,
+                                             ExecutablePath=path.value))
+        if not kernel.TerminateProcess(handle, 1):
+            raise ctypes.WinError(ctypes.get_last_error())
     finally:
         kernel.CloseHandle(handle)

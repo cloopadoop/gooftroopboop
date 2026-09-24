@@ -3,14 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="icon" href="/brand.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/brand-32.png" />
+    <link rel="icon" type="image/png" sizes="64x64" href="/brand-64.png" />
     <title>Goof Troop Boop</title>
   </head>
   <body>
     <div id="app">
       <header class="topbar">
         <div class="brand">
-          <img class="brand-mark" src="/brand.png" alt="">
+          <img class="brand-mark" src="/brand-32.png" srcset="/brand-32.png 1x, /brand-40.png 1.25x, /brand-48.png 1.5x, /brand-64.png 2x" alt="">
           <span class="brand-name">Goof Troop <b>Boop</b></span>
         </div>
         <div class="filemenu">
@@ -25,7 +26,7 @@
               <div class="menu-sep"></div>
               <div class="menu-label">Import</div>
               <button data-imp="spc">SPC…</button>
-              <button data-imp="asm">ASM…</button>
+              <button data-imp="asm" title="Review external ASM and bulk-map instruments to the current sound bank">ASM / instrument mapping…</button>
               <button data-imp="midi">MIDI…</button>
               <button data-imp="rom">From ROM…</button>
               <div class="menu-sep"></div>
@@ -41,6 +42,10 @@
             </div>
           </div>
         </div>
+        <div class="menu-wrap" id="songs-wrap" hidden>
+          <button id="btn-songs" class="text-btn" title="Switch to another song in the loaded ROM">Songs ▾</button>
+          <div class="menu songs-menu" id="menu-songs"></div>
+        </div>
         <div class="song-title" id="song-title">No song loaded</div>
         <div class="transport">
           <button id="btn-undo" class="icon-btn" title="Undo (Ctrl+Z)">↶</button>
@@ -52,6 +57,7 @@
           <span class="time" id="time">0:00 / 0:00</span>
           <span class="sep"></span>
           <button id="btn-add" class="icon-btn" title="Add-note mode (A)"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M17.7 2.3a1 1 0 0 1 1.4 0l2.6 2.6a1 1 0 0 1 0 1.4L9.4 18.6a1 1 0 0 1-.45.26l-4.2 1.2a.75.75 0 0 1-.93-.93l1.2-4.2a1 1 0 0 1 .26-.45L17.7 2.3zM15.3 6.1l2.6 2.6 1.7-1.7-2.6-2.6-1.7 1.7zM6.6 14.8l-.8 2.8 2.8-.8 7.9-7.9-2-2-7.9 7.9z"/></svg></button>
+          <select id="snap" class="snap-select" title="Snap grid for drawing, moving and resizing notes (48 ticks = one beat)" aria-label="Snap grid"></select>
           <button id="btn-tracker" class="icon-btn" title="Tracker view (T)">☰</button>
           <button id="btn-zoomin" class="icon-btn" title="Zoom in (Ctrl+=)">+</button>
           <button id="btn-zoomout" class="icon-btn" title="Zoom out (Ctrl+-)">−</button>

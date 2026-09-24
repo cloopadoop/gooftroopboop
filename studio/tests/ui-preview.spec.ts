@@ -13,6 +13,20 @@ async function openPreview(page: import("@playwright/test").Page) {
   return errors;
 }
 
+test("unlisted instrument references are visible without silent remapping", async ({ page }) => {
+  await page.route("**/sample.json", async route => {
+    const response = await route.fetch();
+    const data = await response.json();
+    const track = data.state.tracks.find((t: any) => t.notes.some((n: any) => !n.rest));
+    track.notes.find((n: any) => !n.rest).program = 26;
+    data.state.programs = data.state.programs.filter((p: any) => p.program !== 26);
+    await route.fulfill({ response, json: data });
+  });
+  await openPreview(page);
+  await expect(page.locator("#bank-warning")).toContainText("Unlisted instruments: 26");
+  await expect(page.locator("#bank-warning")).toContainText("Original references are preserved");
+});
+
 test("loads the sample song in an explicitly read-only shell", async ({ page }) => {
   const errors = await openPreview(page);
 
@@ -26,6 +40,9 @@ test("loads the sample song in an explicitly read-only shell", async ({ page }) 
   await expect(page.locator('#btn-add')).not.toHaveClass(/\bon\b/);
   await expect(page.locator("#status")).toContainText("Preview mode (read-only)");
   await expect(page.locator("#channels .chan")).toHaveCount(8);
+  for (let index = 0; index < 8; index++) {
+    await expect(page.locator("#channels .name").nth(index)).toHaveText(`Track ${index + 1} · CH ${7 - index}`);
+  }
   await expect(page.locator("#channels .chan").nth(2)).toContainText("320 notes");
   await expect(page.locator("#budget")).toContainText("971 / 971 bytes");
 

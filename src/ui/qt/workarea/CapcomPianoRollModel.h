@@ -4,12 +4,16 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <set>
 
 #include "RawFile.h"
 #include "formats/CapcomSnes/CapcomSnesSeq.h"
 #include "formats/CapcomSnes/CapcomSeqIR.h"
 
 struct CapcomNoteEvent {
+  // Every encoded event contributing to this displayed span, including its
+  // own pitch/timing context. A tie is not necessarily adjacent raw bytes.
+  std::vector<CapcomCmdIR> segments;
   int trackIndex{-1};
   uint32_t rawOffset{0};
   uint32_t programChangeOffset{0};
@@ -32,6 +36,9 @@ struct CapcomNoteEvent {
   bool isRest{false};
   bool isLoopRepeat{false};
   uint32_t loopSourceOffset{0};
+  // Replayed after the song-loop GOTO: same bytes as a first-pass event, so
+  // edits must never target it (they would land at the first-pass tick).
+  bool isSongLoopReplay{false};
   std::string instrumentName;
 };
 
@@ -78,11 +85,22 @@ struct CapcomTrackData {
   std::vector<CapcomNoteEvent> notes;
   std::vector<CapcomSettingEvent> settings;
   std::vector<CapcomLoopEvent> loops;
+  // The song loop: the first GOTO whose destination was already played. A
+  // GOTO into bytes not yet played (a channel borrowing another channel's
+  // melody) is not a loop. Every event at or after songLoopTick is a replay
+  // of the first pass (see CapcomNoteEvent::isSongLoopReplay).
+  bool hasSongLoop{false};
+  uint32_t songLoopTick{0};        // where the loop jumps back = end of the first pass
+  uint32_t songLoopDestTick{0};    // where playback resumes
+  uint32_t songLoopGotoOffset{0};  // raw offset of the looping GOTO
 };
 
 class CapcomPianoRollModel : public QObject {
   Q_OBJECT
  public:
+  // Groups existing edit primitives into one history entry. Scope exit rolls
+  // back unless committed, including the original undo/redo histories.
+  class EditTransaction;
   explicit CapcomPianoRollModel(CapcomSnesSeq *seq, QObject *parent = nullptr);
 
   bool reload();
@@ -112,7 +130,8 @@ class CapcomPianoRollModel : public QObject {
                         uint32_t target_len_ticks,
                         uint32_t *out_tick = nullptr,
                         uint32_t *out_duration_diff = nullptr,
-                        std::string *error = nullptr);
+                        std::string *error = nullptr,
+                        const CapcomNoteEvent *sourceNote = nullptr);
 
   // Append a note past the end of a track's events, filling the gap with
   // rests. This is the only way to put notes on a still-empty track, where
@@ -121,7 +140,8 @@ class CapcomPianoRollModel : public QObject {
                         uint32_t tick,
                         int midiKey,
                         uint32_t lenTicks,
-                        std::string *error = nullptr);
+                        std::string *error = nullptr,
+                        const CapcomNoteEvent *sourceNote = nullptr);
 
   bool MoveNote(int trackIndex,
                 size_t noteIndex,
@@ -160,6 +180,10 @@ class CapcomPianoRollModel : public QObject {
                   uint8_t repeatCount,
                   std::string *error = nullptr);
   bool removeLoop(int trackIndex, size_t loopIndex, std::string *error = nullptr);
+  // End the song's loop: replace every track's trailing whole-song GOTO with
+  // an END, so the song plays through once and stops instead of repeating.
+  // No-op (returns true) when nothing loops. Undoable.
+  bool endSongLoops(std::string *error = nullptr);
   // Reclaim sequence bytes: merge adjacent rests into single encodable rest
   // events and drop dead/duplicate setting commands. Safe by construction:
   // jump targets are never removed and act as barriers. Undoable.
@@ -177,7 +201,21 @@ class CapcomPianoRollModel : public QObject {
   // Returns false when the sequence can't be parsed/serialized.
   bool byteUsage(uint32_t *usedOut, uint32_t *budgetOut);
 
+  // Exact single-event lengths in ticks (PPQN 48), including dotted/triplet.
+  // A pending dotted command and available surrounding silence can restrict these.
+  static std::vector<uint32_t> supportedNoteLengths(bool pendingDotted = false);
+
  private:
+  static bool buildTimedEvent(uint32_t ticks, uint8_t key, bool dotted, bool triplet,
+                              std::vector<CapcomCmdIR> &commands);
+  static bool buildRests(uint32_t ticks, bool dotted, bool triplet,
+                         std::vector<CapcomCmdIR> &commands);
+  static bool buildArticulatedNote(uint32_t ticks, uint8_t key, bool dotted, bool triplet,
+                                  bool slurred, uint8_t durationRate, uint8_t program,
+                                  const CapcomNoteEvent *sourceNote, std::vector<CapcomCmdIR> &commands);
+  bool replaceTimedEvent(int trackIndex, uint32_t offset,
+                         const std::vector<CapcomCmdIR> &commands, std::string *error,
+                         int replaceCount = 1);
   bool parseTrack(int trackIndex, uint32_t trackOffset, CapcomTrackData &outTrack);
   static uint32_t lengthFromIndex(uint8_t lenIndex, bool dotted, bool triplet);
   static uint32_t durationFromLength(uint32_t len, uint8_t durationRate, bool slurred);
@@ -217,6 +255,41 @@ class CapcomPianoRollModel : public QObject {
   [[nodiscard]] std::vector<uint8_t> captureRawSnapshot() const;
   void pushRawDiffUndo(const std::vector<uint8_t> &before);
 
+  // Channels can play notes stored in another channel's bytes (Capcom's
+  // melody sharing). Edits made through the borrowing channel would be dropped
+  // by the serializer, which writes each command from its home track only, so
+  // they are refused with a message naming the owning track.
+  [[nodiscard]] int homeTrackOfOffset(uint32_t offset) const;
+  bool rejectBorrowed(int trackIndex, uint32_t offset, std::string *error) const;
+
+  // Self-cleaning for instrument edits: drop a ProgramChange that is either
+  // overwritten at the same tick with nothing audible in between (dead
+  // store) or re-sets the program the voice already holds. Both are in the
+  // inaudible class by corpus render measurement (see regression test
+  // test_instrument_edits_self_clean). Jump landings are never removed and
+  // reset the known state. Returns the number of commands dropped.
+  int dropDeadProgramChanges(const std::set<int> &trackIndices);
+
   static std::vector<std::pair<RawFile *, uint32_t>> s_recentEdits;
 
+};
+
+class CapcomPianoRollModel::EditTransaction {
+ public:
+  explicit EditTransaction(CapcomPianoRollModel &model);
+  ~EditTransaction();
+  EditTransaction(const EditTransaction &) = delete;
+  EditTransaction &operator=(const EditTransaction &) = delete;
+  bool commit(std::string *error = nullptr);
+  bool rollback(std::string *error = nullptr);
+
+ private:
+  CapcomPianoRollModel &m_model;
+  RawFile *m_raw;
+  std::vector<uint8_t> m_before;
+  std::vector<std::vector<EditEntry>> m_undo;
+  std::vector<std::vector<EditEntry>> m_redo;
+  std::vector<std::pair<RawFile *, uint32_t>> m_recentEdits;
+  uint32_t m_allocationFloor;
+  bool m_active{true};
 };

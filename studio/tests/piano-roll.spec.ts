@@ -58,6 +58,67 @@ test('add-note drag encodes duration and active channel',async({page})=>{
   expect(await calls(page,'onAddNote')).toEqual([[0,384,100,72]]);
 });
 
+test('click and sub-threshold jitter retain 24 ticks; intentional draw sizes on note grid',async({page})=>{
+  await page.evaluate(()=>(window as any).testRoll.setAddMode(true));
+  const p=await point(page,384,100);
+  await page.mouse.click(p.x,p.y);
+  await drag(page,p,{x:p.x+1,y:p.y});
+  await drag(page,p,{x:p.x+36,y:p.y});
+  expect(await calls(page,'onAddNote')).toEqual([
+    [0,384,100,24],[0,384,100,24],[0,384,100,72]
+  ]);
+});
+
+test('vertical mouse movement cannot turn a click into a minimum-length draw',async({page})=>{
+  await page.evaluate(()=>(window as any).testRoll.setAddMode(true));
+  const p=await point(page,384,100);
+  await drag(page,p,{x:p.x,y:p.y+24});
+  expect(await calls(page,'onAddNote')).toEqual([[0,384,100,24]]);
+});
+
+test('duration quantization follows encoded lengths and reports requested versus committed ticks',async({page})=>{
+  const lengths=await page.evaluate(async()=>{
+    const {quantizeNoteLength}=await import('/src/pianoroll.ts');
+    return [quantizeNoteLength(25),quantizeNoteLength(70),quantizeNoteLength(72,[24,48,96])];
+  });
+  expect(lengths).toEqual([24,72,48]);
+  // exact-tick grid so the requested length is reported unsnapped
+  await page.evaluate(()=>{const r=(window as any).testRoll;r.setSnap(1);r.setAddMode(true);});
+  const p=await point(page,384,100);
+  await drag(page,p,{x:p.x+25,y:p.y});
+  expect(await calls(page,'onAddNote')).toEqual([[0,384,100,48]]);
+  expect((await calls(page,'onTimingFeedback')).flat().join(' ')).toContain('50 ticks');
+});
+
+test('default 3-tick grid snaps drawn and dragged positions',async({page})=>{
+  await page.evaluate(()=>(window as any).testRoll.setAddMode(true));
+  const p=await point(page,385,100);
+  await page.mouse.click(p.x,p.y);
+  expect(await calls(page,'onAddNote')).toEqual([[0,384,100,24]]);
+  await page.evaluate(()=>(window as any).testRoll.setAddMode(false));
+  const n=await point(page,54,96);
+  await drag(page,n,{x:n.x+25,y:n.y});  // +50 ticks lands on the 3-tick grid
+  expect(await calls(page,'onMoveNote')).toEqual([[0,0,99,96]]);
+});
+
+test('selections survive edits that shift note indices, and drop deleted notes',async({page})=>{
+  const refs=await page.evaluate(()=>{
+    const r=(window as any).testRoll;
+    const note=(i:number,tick:number,pitch:number,rest=false)=>({i,tick,pitch,len:48,dur:48,program:1,rest,loopRepeat:false});
+    const song=(notes:any[])=>({...r.state,tracks:[{...r.state.tracks[0],notes},r.state.tracks[1]]});
+    r.setSelected(0,1);                       // the note at tick 144
+    r.multiSel=[{track:0,note:0},{track:0,note:1}];
+    // an earlier edit inserts a rest: both notes' indices shift by one
+    r.setState(song([note(0,0,-1,true),note(1,48,96),note(2,144,92)]),0,new Set());
+    const shifted={selected:r.selected,group:r.getSelectedRefs()};
+    // the note at tick 48 is deleted: it leaves the group, the other stays
+    r.setState(song([note(0,0,-1,true),note(1,144,92)]),0,new Set());
+    return {shifted,after:{selected:r.selected,group:r.getSelectedRefs()}};
+  });
+  expect(refs.shifted).toEqual({selected:{track:0,note:2},group:[{track:0,note:1},{track:0,note:2}]});
+  expect(refs.after).toEqual({selected:{track:0,note:1},group:[{track:0,note:1}]});
+});
+
 test('marquee selection copies notes and moves them as a group',async({page})=>{
   const a=await point(page,24,98),b=await point(page,204,90);
   await drag(page,a,b);

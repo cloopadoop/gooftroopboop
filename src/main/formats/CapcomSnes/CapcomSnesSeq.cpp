@@ -120,6 +120,8 @@ void CapcomSnesSeq::loadEventMap() {
 
   switch (version) {
     case CAPCOMSNES_V1_BGM_IN_LIST:
+      // Older list-based drivers have real handlers here, not the later RET
+      // stubs. Preserve operand alignment without claiming no-op semantics.
       EventMap[0x1e] = EVENT_UNKNOWN1;
       EventMap[0x1f] = EVENT_UNKNOWN1;
       break;
@@ -681,6 +683,9 @@ bool CapcomSnesTrack::readEvent() {
       }
 
       case EVENT_NOP:
+        // The dispatcher fetches one operand before the $1E/$1F RET
+        // handlers, including the V2/V3 drivers. That byte is not an event.
+        curOffset++;
         addGenericEvent(beginOffset, curOffset - beginOffset, "NOP", "", Type::Misc);
         break;
 

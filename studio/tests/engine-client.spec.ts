@@ -1,7 +1,13 @@
 import { test, expect } from '@playwright/test';
 
 test.beforeEach(async ({ page }) => {
+  // Preview data is fetched after document load. Wait for its network response
+  // under the startup budget before applying the ordinary UI assertion budget.
+  const sample = page.waitForResponse(r => new URL(r.url()).pathname === '/sample.json', {timeout: 90_000});
   await page.goto('/');
+  const response = await sample;
+  expect(response.status()).toBe(200);
+  await response.finished();
   await expect(page.locator('#song-title')).toContainText('Hamlet');
 });
 
@@ -46,7 +52,7 @@ test('engine errors surface and recovery is bounded to one retry', async ({ page
     (window as any).__TAURI__ = {core:{invoke:async () => {
       calls++;
       if (mode === 'validation') return {ok:false,error:'invalid note'};
-      if (mode === 'dead') throw Error('engine closed');
+      if (mode === 'dead') throw 'engine restarted: engine closed';
       return {ok:true,state:{ready:true}};
     }}};
     const {TauriEngine} = await import('/src/engine.ts?client-errors');
@@ -64,11 +70,55 @@ test('engine errors surface and recovery is bounded to one retry', async ({ page
     try { await e.request('state'); } catch (err) { errors.push(String(err)); }
     return {errors,preview,recoveredState,recovered,calls};
   });
-  expect(result.errors).toEqual(['Error: invalid note','Error: invalid note','Error: invalid note','Error: engine closed']);
+  expect(result.errors).toEqual(['Error: invalid note','Error: invalid note','Error: invalid note','Error: engine restarted: engine closed']);
   expect(result.preview).toBeNull();
   expect(result.recoveredState).toEqual({ok:true,state:{ready:true}});
   expect(result.recovered).toBe(2);
   expect(result.calls).toBe(8);
+});
+
+test('send, render and preview recover too; a lost song is reported plainly until one is loaded', async ({ page }) => {
+  const result = await page.evaluate(async () => {
+    let dead = false;
+    const sent: string[] = [];
+    (window as any).__TAURI__ = {core:{invoke:async (_c: string, {request}: any) => {
+      sent.push(request.cmd);
+      if (dead) { dead = false; throw 'engine restarted: engine closed'; }
+      return {ok:true,state:{cmd:request.cmd},wav:'x.wav'};
+    }, convertFileSrc: (p: string) => 'asset:' + p}};
+    const {TauriEngine} = await import('/src/engine.ts?client-recovery');
+    const e = new TauriEngine();
+    const reloads: string[] = [];
+    e.onEngineRestart = async (cmd: string) => { reloads.push(cmd); await e.request('openSession', {path:'a.gtb'}); };
+    dead = true; const edited = await e.send('insertNote', {track:0});
+    dead = true; const rendered = await e.render(1, []);
+    // loading a whole song needs no reload: it just retries on the fresh engine
+    dead = true; const fresh = await e.send('new');
+    // recovery refused (e.g. unsaved changes): later song commands explain, not "no song open"
+    e.onEngineRestart = async () => { throw new Error('unsaved changes cannot be recovered'); };
+    const errors: string[] = [];
+    dead = true; try { await e.send('eraseNote'); } catch (err) { errors.push(String(err)); }
+    try { await e.request('save'); } catch (err) { errors.push(String(err)); }
+    const slots = await e.request('listRomSongs', {path:'r.smc'});
+    const opened = await e.open('b.spc');
+    const after = await e.send('state');
+    return {edited, rendered, fresh, errors, slotsOk: slots.ok, opened, after, reloads, sent};
+  });
+  expect(result.edited).toEqual({cmd:'insertNote'});
+  expect(result.rendered).toMatch(/^asset:x.wav\?v=\d+$/);
+  expect(result.fresh).toEqual({cmd:'new'});
+  expect(result.errors).toEqual(['Error: unsaved changes cannot be recovered', 'Error: unsaved changes cannot be recovered']);
+  expect(result.slotsOk).toBe(true);
+  expect(result.opened).toEqual({cmd:'open'});
+  expect(result.after).toEqual({cmd:'state'});
+  expect(result.reloads).toEqual(['insertNote', 'render']);
+  expect(result.sent).toEqual([
+    'insertNote', 'openSession', 'insertNote',
+    'render', 'openSession', 'render',
+    'new', 'new',
+    'eraseNote',
+    'listRomSongs', 'open', 'state',
+  ]);
 });
 
 test('preview backend rejects file mutations and cannot render audio', async ({ page }) => {

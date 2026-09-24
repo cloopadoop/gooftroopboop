@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -37,8 +38,11 @@
 #include "nlohmann/json.hpp"
 
 #include "RawFile.h"
+#include "AsmSourceRepair.h"
 #include "Root.h"
 #include "formats/CapcomSnes/CapcomSnesSeq.h"
+#include "formats/CapcomSnes/CapcomSnesInstr.h"
+#include "formats/CapcomSnes/CapcomTrackTraversal.h"
 #include "workarea/CapcomPianoRollModel.h"
 
 #include "Snes_Spc.h"
@@ -51,6 +55,16 @@ namespace {
 constexpr uint32_t kAramSize = 0x10000;
 constexpr uint32_t kSpcAramFileOffset = 0x100;
 constexpr char kSpcSignature[] = "SNES-SPC700 Sound File Data";
+
+// Distinct per-process AND per-operation paths: replacing a session destroys
+// the old backing file, so even two successive imports must not share a name.
+std::filesystem::path operationTempPath(const char* role, const char* extension) {
+  static const auto epoch = std::chrono::steady_clock::now().time_since_epoch().count();
+  static uint64_t sequence = 0;
+  return std::filesystem::temp_directory_path() /
+         (std::string("gtb-") + role + "-" + std::to_string(::_getpid()) + "-" +
+          std::to_string(epoch) + "-" + std::to_string(++sequence) + extension);
+}
 
 class TestRoot final : public GTBRoot {
  public:
@@ -111,6 +125,10 @@ struct Session {
   bool priorityInHeader = false;
   std::unique_ptr<RomContext> rom;
   std::filesystem::path sourcePath;
+  // The user file this song was opened from, and so the default target of a
+  // path-less save. Empty for ROM slots, sessions, imports and new songs, where
+  // sourcePath is a label or a temp file that must never be overwritten.
+  std::filesystem::path userPath;
   std::filesystem::path tempAram;
   std::unique_ptr<CapcomSnesSeq> seq;
   std::unique_ptr<CapcomPianoRollModel> model;
@@ -131,6 +149,20 @@ struct Session {
 };
 
 std::unique_ptr<Session> g_session;
+
+// Every Goof Troop song is uploaded to ARAM $0D20 and nothing else lives
+// between there and the SFX bank at $4000 (verified on the driver's ARAM map
+// and on all 19 stock SPC dumps: the gap is 0xFF fill). That gap, not the
+// song's original footprint or ROM slot, is the real size limit; ROM export
+// relocates a song that outgrows its stock slot.
+constexpr uint32_t kSongAramBase = 0x0D20;
+constexpr uint32_t kSongAramCapacity = 0x4000 - kSongAramBase;  // 13024 bytes
+
+void applySongCapacityFloor(Session& s) {
+  if (s.model && s.base == kSongAramBase) {
+    s.model->setAllocationFloor(kSongAramCapacity);
+  }
+}
 
 bool loadSong(const std::string& path, uint32_t base, std::string& err) {
   std::ifstream in(path, std::ios::binary);
@@ -162,8 +194,7 @@ bool loadSong(const std::string& path, uint32_t base, std::string& err) {
   }
   s->priorityInHeader = aram[base] == 0x00;
 
-  s->tempAram = std::filesystem::temp_directory_path() /
-                ("gtb-engine-" + std::filesystem::path(path).stem().string() + ".aram");
+  s->tempAram = operationTempPath("open", ".aram");
   {
     std::ofstream out(s->tempAram, std::ios::binary);
     out.write(reinterpret_cast<const char*>(aram.data()), static_cast<std::streamsize>(aram.size()));
@@ -182,6 +213,7 @@ bool loadSong(const std::string& path, uint32_t base, std::string& err) {
     err = "model reload failed";
     return false;
   }
+  applySongCapacityFloor(*s);
   g_session = std::move(s);
   return true;
 }
@@ -230,6 +262,9 @@ json stateJson() {
   }
   out["tempoBpm"] = tempoBpm;
   out["ppqn"] = 48;
+  // Every tempo change in the first pass (tempo is global to the driver), so
+  // the UI can map ticks to seconds for songs that change tempo mid-song.
+  std::map<uint32_t, double> tempoChanges;
 
   json tracks = json::array();
   for (int t = 0; t < m.trackCount(); ++t) {
@@ -240,25 +275,15 @@ json stateJson() {
     int noteCount = 0;
     json notes = json::array();
     if (data) {
-      // Find the trailing Goto (song loop) FIRST: the traversal unrolls it
-      // one pass, so every event repeats past the goto tick - clip those so
-      // the UI shows a single rendition.
+      // The traversal follows the song loop for one extra pass, so every event
+      // repeats past the loop tick - clip those so the UI shows one rendition.
+      // parseTrack finds the loop as the first GOTO back into already-played
+      // bytes; a GOTO into another channel's melody is not a loop and must not
+      // hide the rest of the channel.
       uint32_t clipTick = 0xFFFFFFFF;
-      {
-        std::string irErr;
-        const auto* trk = m.irTrack(t, &irErr);
-        if (trk) {
-          for (const auto& c : trk->cmds) {
-            if (c.type == CapcomCmdType::Goto && c.destCmdIndex >= 0 &&
-                c.destTrackIndex == trk->trackIndex &&
-                c.destCmdIndex < static_cast<int>(trk->cmds.size())) {
-              tj["songLoop"] = {{"tick", c.tick},
-                                {"destTick", trk->cmds[static_cast<size_t>(c.destCmdIndex)].tick}};
-              clipTick = c.tick;
-              break;
-            }
-          }
-        }
+      if (data->hasSongLoop) {
+        tj["songLoop"] = {{"tick", data->songLoopTick}, {"destTick", data->songLoopDestTick}};
+        clipTick = data->songLoopTick;
       }
       for (size_t ni = 0; ni < data->notes.size(); ++ni) {
         const auto& n = data->notes[ni];
@@ -267,6 +292,7 @@ json stateJson() {
                          {"tick", n.startTick},
                          {"len", n.deltaTicks},
                          {"dur", n.durationTicks},
+                         {"timingLengths", CapcomPianoRollModel::supportedNoteLengths(n.dotted)},
                          {"pitch", n.midiKey},
                          {"rest", n.isRest},
                          {"program", n.program},
@@ -282,6 +308,12 @@ json stateJson() {
       for (size_t si = 0; si < data->settings.size(); ++si) {
         const auto& s = data->settings[si];
         if (s.tick >= clipTick) continue;
+        if (s.type == CapcomSettingType::Tempo) {
+          const uint16_t tw = static_cast<uint16_t>((s.value1 << 8) | s.value2);
+          if (tw != 0) {
+            tempoChanges[s.tick] = 60000000.0 / (48.0 * 125.0 * 64.0 * 2.0) * (tw / 256.0);
+          }
+        }
         settings.push_back({{"i", si},
                             {"tick", s.tick},
                             {"type", settingTypeName(s.type)},
@@ -308,13 +340,31 @@ json stateJson() {
     tracks.push_back(tj);
   }
   out["tracks"] = tracks;
+  json tempoMap = json::array();
+  if (tempoChanges.empty() || tempoChanges.begin()->first != 0) {
+    tempoMap.push_back({{"tick", 0}, {"bpm", tempoBpm}});
+  }
+  for (const auto& [tick, bpm] : tempoChanges) {
+    if (!tempoMap.empty() && tempoMap.back()["bpm"].get<double>() == bpm) {
+      continue;  // same tempo re-set: not a change
+    }
+    tempoMap.push_back({{"tick", tick}, {"bpm", bpm}});
+  }
+  out["tempoMap"] = tempoMap;
   return out;
 }
+
+bool writeFileAtomically(const std::string& path, const std::vector<uint8_t>& bytes, std::string& err);
+bool currentSeqBytes(std::vector<uint8_t>& image, uint32_t& base, bool& prio, CapcomSeqIR& ir, std::string& err);
 
 // Save the edited ARAM back into the original container and write to `path`.
 bool saveSong(const std::string& path, std::string& err) {
   if (!g_session || !g_session->raw) {
     err = "no song open";
+    return false;
+  }
+  if (path.empty()) {
+    err = "save needs a destination path";
     return false;
   }
   std::vector<uint8_t> outBytes = g_session->originalBytes;
@@ -323,19 +373,23 @@ bool saveSong(const std::string& path, std::string& err) {
       outBytes[g_session->aramFileOffset + i] = g_session->raw->readByte(i);
     }
   } else {
-    // .bin: write the song image region starting at base.
+    // .bin: the song image region starting at base. It can outgrow the file it
+    // came from (the budget is the whole ARAM window), so size the output to
+    // the current footprint when that is larger; sizing it to the original
+    // file dropped the tail and left track pointers past the end.
+    std::vector<uint8_t> image;
+    uint32_t imageBase = 0;
+    bool prio = false;
+    CapcomSeqIR ir;
+    if (!currentSeqBytes(image, imageBase, prio, ir, err)) {
+      return false;
+    }
+    outBytes.resize(std::max(outBytes.size(), image.size()));
     for (size_t i = 0; i < outBytes.size(); ++i) {
-      outBytes[i] = g_session->raw->readByte(g_session->base + i);
+      outBytes[i] = g_session->raw->readByte(static_cast<uint32_t>(g_session->base + i));
     }
   }
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) {
-    err = "cannot open output";
-    return false;
-  }
-  out.write(reinterpret_cast<const char*>(outBytes.data()),
-            static_cast<std::streamsize>(outBytes.size()));
-  return true;
+  return writeFileAtomically(path, outBytes, err);
 }
 
 // ---- Native SPC playback ---------------------------------------------------
@@ -366,18 +420,24 @@ bool renderSpcWav(const std::vector<uint8_t>& spc, int seconds, int muteMask,
 // This catches driver subtleties (re-set side effects, slur interactions)
 // that static IR reasoning cannot.
 bool verifiedOptimize(uint32_t* b0, uint32_t* b1, std::string* err) {
-  const int kVerifySeconds = 15;
+  // Long enough to cover a full pass of any stock song plus its loop point;
+  // edits late in a song were never checked at the old 15 s.
+  const int kVerifySeconds = 90;
   std::vector<uint8_t> spcBefore;
   if (!currentSpc(spcBefore, *err)) return false;
   uint32_t before = 0, after = 0;
   if (!g_session->model->optimizeSequence(&before, &after, err)) return false;
   if (b0) *b0 = before;
   if (b1) *b1 = after;
-  if (after >= before) return true;  // nothing changed
   std::vector<uint8_t> wavA, wavB, spcAfter;
   std::string rerr;
-  if (!renderSpcWav(spcBefore, kVerifySeconds, 0, wavA, rerr) ||
-      !currentSpc(spcAfter, rerr) ||
+  if (!currentSpc(spcAfter, rerr) || spcAfter == spcBefore) {
+    return true;  // nothing was rewritten, so optimize pushed no undo batch
+  }
+  // Bytes were rewritten (optimize pushed exactly one undo batch). A rewrite
+  // that saves nothing is pure risk - shared-data songs can even grow - so
+  // roll it back without rendering; otherwise the render must match.
+  if (after >= before || !renderSpcWav(spcBefore, kVerifySeconds, 0, wavA, rerr) ||
       !renderSpcWav(spcAfter, kVerifySeconds, 0, wavB, rerr) || wavA != wavB) {
     std::string uerr;
     g_session->model->undo(&uerr);  // optimize pushed exactly one undo batch
@@ -394,21 +454,21 @@ bool mergeTracksInto(int src, int dst, std::string* err) {
   auto* m = g_session->model.get();
   const auto* sd = m->trackData(src);
   if (!sd) { *err = "invalid source track"; return false; }
-  struct SrcNote { uint32_t tick; int key; uint32_t len; uint8_t program; };
+  struct SrcNote { uint32_t tick; int key; uint32_t len; uint8_t program; CapcomNoteEvent source; };
   std::vector<SrcNote> moves;
   for (const auto& n : sd->notes) {
     if (n.isRest || n.isLoopRepeat || n.midiKey < 0) continue;
-    moves.push_back({n.startTick, n.midiKey, n.deltaTicks, n.program});
+    moves.push_back({n.startTick, n.midiKey, n.deltaTicks, n.program, n});
   }
   std::sort(moves.begin(), moves.end(),
             [](const SrcNote& a, const SrcNote& b) { return a.tick < b.tick; });
   for (const auto& mv : moves) {
     uint32_t insertedTick = 0;
     std::string e;
-    bool placed = m->InsertNoteAtTick(dst, mv.tick, mv.key, mv.len, &insertedTick, nullptr, &e);
+    bool placed = m->InsertNoteAtTick(dst, mv.tick, mv.key, mv.len, &insertedTick, nullptr, &e, &mv.source);
     if (!placed && e.find("No event at this position") != std::string::npos) {
       e.clear();
-      placed = m->AppendNoteAtTick(dst, mv.tick, mv.key, mv.len, &e);
+      placed = m->AppendNoteAtTick(dst, mv.tick, mv.key, mv.len, &e, &mv.source);
       insertedTick = mv.tick;
     }
     if (!placed && e.find("bytes are allocated") != std::string::npos) {
@@ -416,10 +476,10 @@ bool mergeTracksInto(int src, int dst, std::string* err) {
       std::string oe;
       if (verifiedOptimize(&b0, &b1, &oe) && b1 < b0) {
         e.clear();
-        placed = m->InsertNoteAtTick(dst, mv.tick, mv.key, mv.len, &insertedTick, nullptr, &e);
+        placed = m->InsertNoteAtTick(dst, mv.tick, mv.key, mv.len, &insertedTick, nullptr, &e, &mv.source);
         if (!placed && e.find("No event at this position") != std::string::npos) {
           e.clear();
-          placed = m->AppendNoteAtTick(dst, mv.tick, mv.key, mv.len, &e);
+          placed = m->AppendNoteAtTick(dst, mv.tick, mv.key, mv.len, &e, &mv.source);
           insertedTick = mv.tick;
         }
       }
@@ -431,7 +491,10 @@ bool mergeTracksInto(int src, int dst, std::string* err) {
         if (!dd->notes[i].isRest && dd->notes[i].startTick == insertedTick) {
           if (dd->notes[i].program != mv.program) {
             std::string ie;
-            m->setInstrument({{dst, static_cast<int>(i)}}, mv.program, &ie);
+            if (!m->setInstrument({{dst, static_cast<int>(i)}}, mv.program, &ie)) {
+              *err = "merge could not preserve an instrument: " + ie;
+              return false;
+            }
           }
           break;
         }
@@ -615,14 +678,18 @@ std::filesystem::path renderToTemp(const std::vector<uint8_t>& wav, const char* 
 
 // Locate an ffmpeg binary: explicit override, bundled beside the engine exe,
 // then PATH. The Tauri app bundles ffmpeg as a resource and sets GTB_FFMPEG.
+std::filesystem::path exeDir();
+
 std::string findFfmpeg() {
   if (const char* e = std::getenv("GTB_FFMPEG")) {
     if (*e) return e;
   }
   std::error_code ec;
-  auto exeDir = std::filesystem::current_path(ec);
+  // beside the engine exe as documented - not the working directory, which
+  // depends on how the engine was launched
+  const auto dir = exeDir();
   for (const char* name : {"ffmpeg.exe", "ffmpeg"}) {
-    auto cand = exeDir / name;
+    auto cand = dir / name;
     if (std::filesystem::exists(cand, ec)) return cand.string();
   }
   return "ffmpeg";  // rely on PATH
@@ -784,7 +851,11 @@ bool exportAsmText(std::string& out, std::string& err) {
 
   std::ostringstream o;
   o << "; Goof Troop Boop - Capcom SPC700 music (lossless ASM)\n";
-  o << "; Reassemble with the same tool: Import > ASM.\n\n";
+  o << "; Reassemble with the same tool: Import > ASM.\n";
+  o << "; Data-only dialect: db/.db, dw/.dw (big-endian), labels, .base, numeric aliases.\n";
+  o << "; Aliases: !instrument_16 = #$01 then db $08, !instrument_16\n";
+  o << "; Import maps resolved program values (1 above), not alias name suffixes (16).\n";
+  o << "; External samples/drivers are not imported; review the target bank before importing.\n\n";
   o << ".base $" << hex4(base) << "\n\n";
   if (prio) o << "\t.db $" << hex2(at(base)) << "        ; song priority/type byte\n";
   o << "; channel pointer table (8 x 16-bit big-endian)\n";
@@ -836,82 +907,291 @@ uint32_t parseNum(const std::string& tok) {
   return static_cast<uint32_t>(std::strtoul(t.c_str(), nullptr, 10));
 }
 
-// Assemble the .db/.dw/label/.base dialect back to a raw sequence image.
+// Strict data-only dialect. Never evaluate expressions or execute assembler code.
+std::string asmTrim(const std::string& text) {
+  const auto begin = text.find_first_not_of(" \t\r\n");
+  if (begin == std::string::npos) {
+    return {};
+  }
+  return text.substr(begin, text.find_last_not_of(" \t\r\n") - begin + 1);
+}
+
+bool asmNumber(std::string token, uint32_t& value) {
+  if (!token.empty() && token[0] == '#') {
+    token.erase(0, 1);
+  }
+  unsigned radix = 10;
+  if (!token.empty() && token[0] == '$') {
+    radix = 16;
+    token.erase(0, 1);
+  } else if (token.size() > 2 && token.substr(0, 2) == "0x") {
+    radix = 16;
+    token.erase(0, 2);
+  }
+  if (token.empty()) {
+    return false;
+  }
+  value = 0;
+  for (char c : token) {
+    const unsigned digit = c >= '0' && c <= '9' ? c - '0' :
+                           c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+                           c >= 'A' && c <= 'F' ? c - 'A' + 10 : 99;
+    if (digit >= radix || value > (65535u - digit) / radix) {
+      return false;
+    }
+    value = value * radix + digit;
+  }
+  return true;
+}
+
+bool asmSymbol(std::string name) {
+  if (!name.empty() && name[0] == '!') {
+    name.erase(0, 1);
+  }
+  if (name.empty() || (name[0] >= '0' && name[0] <= '9')) {
+    return false;
+  }
+  return name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_") ==
+         std::string::npos;
+}
+
+// Assemble .db/db, .dw/dw (big-endian), labels, .base and numeric aliases.
 // bytesOut[0] corresponds to ARAM address `baseOut`.
 bool assembleAsm(const std::string& text, uint32_t& baseOut, std::vector<uint8_t>& bytesOut,
-                 std::string& err) {
-  struct Line { std::string op; std::vector<std::string> args; std::string label; };
+                 std::string& err, std::map<uint32_t, unsigned>* lineOffsets = nullptr) {
+  struct Line { std::string op; std::vector<std::string> args; std::string label; unsigned number; };
   std::vector<Line> lines;
+  std::map<std::string, uint32_t> aliases;
   uint32_t base = 0x0D20;
   bool baseSet = false;
-
+  unsigned number = 0;
+  // CapcomToASM's exact upload wrapper is recognized as a file format, not
+  // evaluated as ASM. Discard its four-byte ROM upload header; channel addresses
+  // are ARAM-relative to Channels, as verified against local SPC sequence bytes.
+  unsigned wrapper = 0;
+  bool patchWrapper = false;
+  std::string patchLabel;
+  auto fail = [&](const std::string& reason) {
+    err = "ASM line " + std::to_string(number) + ": " + reason;
+    return false;
+  };
   std::istringstream in(text);
   std::string raw;
   while (std::getline(in, raw)) {
+    ++number;
     auto sc = raw.find(';');
-    if (sc != std::string::npos) raw = raw.substr(0, sc);
-    // trim
-    auto b = raw.find_first_not_of(" \t\r\n");
-    if (b == std::string::npos) continue;
-    auto e = raw.find_last_not_of(" \t\r\n");
-    std::string line = raw.substr(b, e - b + 1);
-    if (line.empty()) continue;
-
-    if (!line.empty() && line.back() == ':') {
-      lines.push_back({"label", {}, line.substr(0, line.size() - 1)});
+    std::string line = asmTrim(raw.substr(0, sc));
+    if (line.empty()) {
       continue;
+    }
+    std::string compact;
+    for (char c : line) {
+      if (c != ' ' && c != '\t') {
+        compact.push_back(c);
+      }
+    }
+    if (compact == "lorom" && !baseSet && lines.empty() && aliases.empty() && wrapper == 0) {
+      wrapper = 1;
+      continue;
+    }
+    // Recognize the bounded song-table patch envelope as metadata only. Never
+    // execute org/dl, evaluate arbitrary expressions, or modify a ROM on import.
+    if (wrapper == 1 && compact.rfind("org$848000+($", 0) == 0) {
+      uint32_t slot;
+      if (patchWrapper || compact.size() != 18 || compact.substr(15) != "*3)" ||
+          !asmNumber("$" + compact.substr(13, 2), slot) || slot >= 0x30) {
+        return fail("invalid song-table patch slot");
+      }
+      patchWrapper = true;
+      wrapper = 100;
+      continue;
+    }
+    if (wrapper == 100) {
+      if (compact.size() <= 8 || compact.substr(0, 2) != "dl" ||
+          compact.substr(compact.size() - 6) != "-$8000") {
+        return fail("expected song-label relocation metadata");
+      }
+      patchLabel = compact.substr(2, compact.size() - 8);
+      if (!asmSymbol(patchLabel) || patchLabel[0] == '!') {
+        return fail("invalid song-label relocation metadata");
+      }
+      wrapper = 1;
+      continue;
+    }
+    if (wrapper >= 101 && wrapper <= 104) {
+      bool valid = false;
+      switch (wrapper) {
+        case 101:
+          valid = compact.substr(0, 10) == "!ARAMAddr=" && asmNumber(compact.substr(10), base);
+          baseSet = valid;
+          break;
+        case 102: valid = compact == "dwEndOfSong-SongStart"; break;
+        case 103: valid = compact == "dw!ARAMAddr"; break;
+        case 104: valid = compact == "SongStart:"; break;
+      }
+      if (!valid) {
+        return fail("unsupported song patch upload header");
+      }
+      wrapper = wrapper == 104 ? 7 : wrapper + 1;
+      continue;
+    }
+    if (wrapper > 0 && wrapper < 9) {
+      bool valid = false;
+      switch (wrapper) {
+        case 1:
+          valid = compact == "functionBigEndian(n)=(((n&$ff00)>>8)|((n&$00ff)<<8))";
+          break;
+        case 2: {
+          uint32_t high, low;
+          valid = compact.size() == 10 && compact.substr(0, 4) == "org$" &&
+                  asmNumber("$" + compact.substr(4, 2), high) &&
+                  asmNumber("$" + compact.substr(6), low);
+          break;
+        }
+        case 3:
+          if (patchWrapper) {
+            if (compact != patchLabel + ":") {
+              return fail("relocation label does not match upload label");
+            }
+            wrapper = 101;
+            continue;
+          }
+          valid = compact.substr(0, 10) == "!ARAMAddr=" && asmNumber(compact.substr(10), base);
+          baseSet = valid;
+          break;
+        case 4:
+          if (compact == "dwEndOfSong-SongStart") {
+            wrapper = 103;
+            continue;
+          }
+          valid = compact == "SongStart:";
+          break;
+        case 5: valid = compact == "dwSongStart-EndOfSong"; break;
+        case 6: valid = compact == "dw!ARAMAddr"; break;
+        case 7: valid = compact == "Channels:"; break;
+        case 8: valid = compact == "!ARAMC=!ARAMAddr-SongStart"; break;
+      }
+      if (!valid) {
+        return fail("unsupported CapcomToASM wrapper; expected canonical upload header");
+      }
+      ++wrapper;
+      continue;
+    }
+    if (wrapper >= 9 && wrapper < 17) {
+      const std::string channel = "Channel0" + std::to_string(wrapper - 9);
+      if (compact != "dwBigEndian(" + channel + "+!ARAMC)") {
+        return fail("expected eight canonical BigEndian channel pointers");
+      }
+      lines.push_back({".dw", {channel}, "", number});
+      ++wrapper;
+      continue;
+    }
+    const auto equal = line.find('=');
+    if (equal != std::string::npos) {
+      const auto name = asmTrim(line.substr(0, equal));
+      uint32_t value;
+      if (!asmSymbol(name) || !asmNumber(asmTrim(line.substr(equal + 1)), value)) {
+        return fail("expected numeric alias, e.g. !instrument_16 = #$01");
+      }
+      if (aliases.count(name) && aliases[name] != value) {
+        return fail("conflicting alias: " + name);
+      }
+      aliases[name] = value;
+      continue;
+    }
+    const auto colon = line.find(':');
+    if (colon != std::string::npos) {
+      const auto name = asmTrim(line.substr(0, colon));
+      if (!asmSymbol(name)) {
+        return fail("invalid label: " + name);
+      }
+      lines.push_back({"label", {}, name, number});
+      line = asmTrim(line.substr(colon + 1));
+      if (line.empty()) {
+        continue;
+      }
     }
     std::istringstream ls(line);
     std::string op;
     ls >> op;
     std::string lop = op;
     std::transform(lop.begin(), lop.end(), lop.begin(), ::tolower);
+    if (lop == "db" || lop == "dw") {
+      lop = "." + lop;
+    }
     std::string rest;
     std::getline(ls, rest);
     std::vector<std::string> args;
     std::string tok;
     std::istringstream as(rest);
     while (std::getline(as, tok, ',')) {
-      auto tb = tok.find_first_not_of(" \t");
-      if (tb == std::string::npos) continue;
-      auto te = tok.find_last_not_of(" \t");
-      args.push_back(tok.substr(tb, te - tb + 1));
+      tok = asmTrim(tok);
+      if (tok.empty()) {
+        return fail("empty operand");
+      }
+      args.push_back(tok);
+    }
+    if (args.empty() || (!asmTrim(rest).empty() && asmTrim(rest).back() == ',')) {
+      return fail("missing operand");
     }
     if (lop == ".base") {
-      base = parseNum(args.empty() ? "0" : args[0]);
+      if (baseSet || !lines.empty() || args.size() != 1 || !asmNumber(args[0], base)) {
+        return fail(".base requires one 16-bit literal before all labels/data, once only");
+      }
       baseSet = true;
     } else if (lop == ".db" || lop == ".dw") {
-      lines.push_back({lop, args, ""});
+      lines.push_back({lop, args, "", number});
+    } else {
+      return fail("unsupported directive: " + op + "; use db/dw, labels, .base and numeric aliases");
     }
   }
-  (void)baseSet;
-
-  // Pass 1: assign label addresses (bytes: .db = N, .dw = 2 each arg).
-  std::map<std::string, uint32_t> labels;
+  std::map<std::string, uint32_t> labels = aliases;
+  if (wrapper && wrapper != 17) {
+    return fail("incomplete CapcomToASM upload wrapper");
+  }
   uint32_t off = 0;
   for (const auto& l : lines) {
-    if (l.op == "label") { labels[l.label] = base + off; }
-    else if (l.op == ".db") off += static_cast<uint32_t>(l.args.size());
-    else if (l.op == ".dw") off += static_cast<uint32_t>(l.args.size()) * 2;
-  }
-  // Pass 2: emit bytes.
-  std::vector<uint8_t> bytes;
-  for (const auto& l : lines) {
-    if (l.op == ".db") {
-      for (const auto& a : l.args) bytes.push_back(static_cast<uint8_t>(parseNum(a) & 0xFF));
-    } else if (l.op == ".dw") {
-      for (const auto& a : l.args) {
-        uint32_t v;
-        if (!a.empty() && (a[0] == '$' || (a[0] >= '0' && a[0] <= '9'))) v = parseNum(a);
-        else {
-          auto it = labels.find(a);
-          if (it == labels.end()) { err = "undefined label: " + a; return false; }
-          v = it->second;
-        }
-        bytes.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));  // big-endian
-        bytes.push_back(static_cast<uint8_t>(v & 0xFF));
+    number = l.number;
+    if (l.op == "label") {
+      if (labels.count(l.label)) {
+        return fail("duplicate label or alias collision: " + l.label);
       }
+      labels[l.label] = base + off;
+    } else {
+      const size_t size = l.args.size() * (l.op == ".dw" ? 2 : 1);
+      if (size > 65536u - base - off) {
+        return fail("data exceeds ARAM");
+      }
+      off += static_cast<uint32_t>(size);
     }
+  }
+  std::vector<uint8_t> bytes;
+  if (lineOffsets) {
+    lineOffsets->clear();
+  }
+  for (const auto& l : lines) {
+    number = l.number;
+    if (lineOffsets && !l.args.empty()) {
+      (*lineOffsets)[static_cast<uint32_t>(bytes.size())] = number;
+    }
+    for (const auto& a : l.args) {
+      uint32_t v;
+      if (labels.count(a)) {
+        v = labels[a];
+      } else if (!asmNumber(a, v)) {
+        return fail("undefined alias/label or invalid literal: " + a);
+      }
+      if (v > (l.op == ".db" ? 255u : 65535u)) {
+        return fail("operand out of range: " + a);
+      }
+      if (l.op == ".dw") {
+        bytes.push_back(static_cast<uint8_t>(v >> 8));
+      }
+      bytes.push_back(static_cast<uint8_t>(v));
+    }
+  }
+  if (bytes.empty()) {
+    return fail("no sequence data");
   }
   baseOut = base;
   bytesOut = std::move(bytes);
@@ -979,7 +1259,7 @@ bool loadSequenceImage(const std::vector<uint8_t>& seqBytes, uint32_t base,
   s->base = base;
   s->sourcePath = sourceName;
   s->priorityInHeader = aram[base] == 0x00;
-  s->tempAram = std::filesystem::temp_directory_path() / "gtb-engine-import.aram";
+  s->tempAram = operationTempPath("import", ".aram");
   {
     std::ofstream out(s->tempAram, std::ios::binary);
     out.write(reinterpret_cast<const char*>(aram.data()), static_cast<std::streamsize>(aram.size()));
@@ -990,7 +1270,221 @@ bool loadSequenceImage(const std::vector<uint8_t>& seqBytes, uint32_t base,
   s->seq->parseTrackPointers();
   s->model = std::make_unique<CapcomPianoRollModel>(s->seq.get());
   if (!s->model->reload()) { err = "model reload failed after import"; return false; }
+  applySongCapacityFloor(*s);
   g_session = std::move(s);
+  return true;
+}
+
+// ASM-only preflight: all work is on private bytes. Neither review nor failure
+// touches the current session, its undo stack, or its source/ROM association.
+bool prepareAsmImport(std::vector<uint8_t>& bytes, uint32_t base, const json& mappings,
+                      bool review, json& report, std::string& err) {
+  if (base != kSongAramBase || bytes.size() > kSongAramCapacity || bytes.size() < 17) {
+    err = "ASM must contain a complete Goof Troop sequence at .base $0D20, within $0D20..$3FFF";
+    return false;
+  }
+  const bool priority = bytes[0] == 0;
+  const size_t header = priority ? 1 : 0;
+  for (size_t t = 0; t < 8; ++t) {
+    const uint32_t pointer = (bytes[header + t * 2] << 8) | bytes[header + t * 2 + 1];
+    if (pointer < base + header + 16 || pointer >= base + bytes.size()) {
+      err = "ASM channel " + std::to_string(t + 1) + " pointer is outside the supplied sequence";
+      return false;
+    }
+  }
+  std::vector<uint8_t> bank;
+  uint32_t aramOff = kSpcAramFileOffset;
+  if (g_session && g_session->isSpc) {
+    bank = g_session->originalBytes;
+    aramOff = g_session->aramFileOffset;
+    report["targetBank"] = g_session->sourcePath.string();
+  } else {
+    std::ifstream in(soundBankPath(), std::ios::binary);
+    bank.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    report["targetBank"] = soundBankPath();
+  }
+  if (bank.size() < aramOff + kAramSize + 128 ||
+      std::memcmp(bank.data(), kSpcSignature, sizeof(kSpcSignature) - 1) != 0) {
+    err = "ASM target bank must be a valid SPC containing ARAM and DSP registers";
+    return false;
+  }
+  VirtFile bankRaw(bank.data() + aramOff, kAramSize, "asm-bank");
+  // Same non-executing signature as CapcomSnesScanner::ptnLoadInstrTableAddress.
+  const uint8_t pattern[] = {0x8d, 0x06, 0xcf, 0xda, 0, 0x60, 0x98, 0, 0, 0x98, 0, 0};
+  uint32_t table = 0;
+  for (uint32_t i = 0; i + sizeof(pattern) <= kAramSize; ++i) {
+    bool match = true;
+    for (size_t k = 0; k < sizeof(pattern); ++k) {
+      if (pattern[k] && bankRaw.readByte(i + k) != pattern[k]) {
+        match = false;
+      }
+    }
+    if (match) {
+      const uint32_t found = bankRaw.readByte(i + 7) | (bankRaw.readByte(i + 10) << 8);
+      if (table && table != found) {
+        err = "ASM target bank has ambiguous instrument tables";
+        return false;
+      }
+      table = found;
+    }
+  }
+  if (!table) {
+    err = "ASM target bank has no supported Capcom instrument table; open a Goof Troop SPC first";
+    return false;
+  }
+  const uint32_t dir = bank[aramOff + kAramSize + 0x5d] << 8;
+  std::map<unsigned, bool> available;
+  report["targetPrograms"] = json::array();
+  report["silentPrograms"] = json::array();
+  for (unsigned program = 0; program <= 255; ++program) {
+    const uint32_t entry = table + 6 * program;
+    if (entry + 6 > kAramSize) {
+      break;
+    }
+    bool blank = true;
+    for (unsigned k = 0; k < 6; ++k) {
+      const auto value = bankRaw.readByte(entry + k);
+      if (value != 0 && value != 255) {
+        blank = false;
+      }
+    }
+    if (blank) {
+      continue;
+    }
+    if (!CapcomSnesInstr::isValidHeader(&bankRaw, entry, dir, false)) {
+      // The stock Goof Troop bank's $17 entry deliberately sets ADSR/GAIN
+      // to zero. It is used to mute a part, not as a sampled instrument.
+      // Qualify the exact location/header; do not admit arbitrary garbage
+      // after the instrument table or accept zero envelopes in other banks.
+      const uint8_t muteHeader[] = {2, 0, 0, 0, 0, 0};
+      bool isMute = program == 0x17 && table == 0x505C && dir == 0x5000;
+      for (unsigned k = 0; isMute && k < sizeof(muteHeader); ++k) {
+        isMute = bankRaw.readByte(entry + k) == muteHeader[k];
+      }
+      if (isMute) {
+        available[program] = true;
+        report["targetPrograms"].push_back(program);
+        report["silentPrograms"].push_back(program);
+      }
+      break;
+    }
+    if (CapcomSnesInstr::isValidHeader(&bankRaw, entry, dir, true)) {
+      available[program] = true;
+      report["targetPrograms"].push_back(program);
+    }
+  }
+  if (!mappings.is_array()) {
+    err = "programMap must be an array of {from,to} byte values";
+    return false;
+  }
+  std::map<unsigned, unsigned> map;
+  for (const auto& entry : mappings) {
+    if (!entry.is_object() || !entry.contains("from") || !entry.contains("to") ||
+        !entry["from"].is_number_integer() || !entry["to"].is_number_integer() ||
+        entry["from"] < 0 || entry["from"] > 255 || entry["to"] < 0 || entry["to"] > 255) {
+      err = "programMap requires integer from/to values in 0..255";
+      return false;
+    }
+    const unsigned from = entry["from"].get<unsigned>();
+    const unsigned to = entry["to"].get<unsigned>();
+    if ((map.count(from) && map[from] != to) || !available.count(to)) {
+      err = "conflicting map or unavailable target-bank program: " + std::to_string(from) +
+            " -> " + std::to_string(to);
+      return false;
+    }
+    map[from] = to;
+  }
+  // Zero outside the supplied image: never let a malformed track consume old song bytes.
+  std::vector<uint8_t> aram(kAramSize, 0);
+  std::copy(bytes.begin(), bytes.end(), aram.begin() + base);
+  VirtFile raw(aram.data(), kAramSize, "asm-sequence");
+  std::map<unsigned, unsigned> used;
+  std::map<uint32_t, unsigned> patches;
+  unsigned notes = 0;
+  unsigned inactiveExternalJumps = 0;
+  for (int t = 0; t < 8; ++t) {
+    CapcomTrackTraversalResult traversal;
+    const uint32_t start = raw.readShortBE(base + header + t * 2);
+    if (!CapcomTrackTraversal::Traverse(&raw, start, &traversal, &err, true)) {
+      err = "ASM channel " + std::to_string(t + 1) + ": " + err;
+      return false;
+    }
+    bool hasProgram = false;
+    for (size_t stepIndex = 0; stepIndex < traversal.steps.size(); ++stepIndex) {
+      const auto& step = traversal.steps[stepIndex];
+      const auto& cmd = step.cmd;
+      if (cmd.origAbsOffset < base + header + 16 ||
+          cmd.origAbsOffset + cmd.sizeBytes > base + bytes.size() || cmd.type == CapcomCmdType::Unknown) {
+        err = "ASM contains a truncated/unsupported command or leaves the supplied sequence";
+        return false;
+      }
+      if (cmd.type == CapcomCmdType::ProgramChange) {
+        hasProgram = true;
+        const unsigned program = cmd.params.at(0);  // traversal's cmd.program is the pre-command state
+        ++used[program];
+        const unsigned target = map.count(program) ? map[program] : program;
+        patches[cmd.origAbsOffset + 1 - base] = target;
+      }
+      if (cmd.type == CapcomCmdType::Note) {
+        ++notes;
+        if (!hasProgram) {
+          err = "ASM channel " + std::to_string(t + 1) +
+                " has notes before a program command; add db $08, <program> at its start";
+          return false;
+        }
+      }
+      if (cmd.type == CapcomCmdType::Goto || cmd.type == CapcomCmdType::RepeatUntil ||
+          cmd.type == CapcomCmdType::RepeatBreak) {
+        if (cmd.destWord < base + header + 16 || cmd.destWord >= base + bytes.size()) {
+          // An untaken repeat-break still has two operand bytes, but the
+          // driver never dereferences them. Retain those bytes verbatim.
+          // A taken branch is independently bounded by its next trace step.
+          const bool fallsThrough = stepIndex + 1 < traversal.steps.size() &&
+              traversal.steps[stepIndex + 1].cmd.origAbsOffset == cmd.origAbsOffset + cmd.sizeBytes;
+          if (cmd.type != CapcomCmdType::RepeatBreak || !fallsThrough) {
+            err = "ASM jump leaves the supplied sequence";
+            return false;
+          }
+          ++inactiveExternalJumps;
+        }
+      }
+    }
+  }
+  report["sourcePrograms"] = json::array();
+  report["unmappedPrograms"] = json::array();
+  for (const auto& [program, count] : used) {
+    report["sourcePrograms"].push_back(program);
+    const unsigned target = map.count(program) ? map[program] : program;
+    if (!available.count(target)) {
+      report["unmappedPrograms"].push_back(program);
+    }
+  }
+  for (const auto& [from, to] : map) {
+    if (!used.count(from)) {
+      err = "mapped source program " + std::to_string(from) + " is not used (map resolved alias values)";
+      return false;
+    }
+  }
+  report["noteCommands"] = notes;
+  report["inactiveExternalJumps"] = inactiveExternalJumps;
+  report["warnings"] = json::array({"ASM imports sequence data only, not external samples or drivers. "
+                                    "Valid programs do not guarantee audible output; audition after import."});
+  if (inactiveExternalJumps) {
+    report["warnings"].push_back("Untaken conditional branches contain external addresses. Their bytes are "
+                                  "preserved. Structural edits are accepted only while those branches remain untaken.");
+  }
+  if (!notes) {
+    err = "ASM has no note commands; refusing a silent import";
+    return false;
+  }
+  if (!review && !report["unmappedPrograms"].empty()) {
+    err = "ASM uses unavailable target-bank programs " + report["unmappedPrograms"].dump() +
+          "; supply programMap or review the import in Studio";
+    return false;
+  }
+  for (const auto& [offset, target] : patches) {
+    bytes[offset] = static_cast<uint8_t>(target);
+  }
   return true;
 }
 
@@ -1135,7 +1629,7 @@ bool importMidiGeneric(const std::string& midiPath, const json& opts, std::strin
     err = "GTBoop-cli not found (set GTB_CLI); cannot convert generic MIDI";
     return false;
   }
-  const auto outSpc = std::filesystem::temp_directory_path() / "gtb-import-midi.spc";
+  const auto outSpc = operationTempPath("midi", ".spc");
   std::string args;
   if (opts.contains("defaultProgram")) {
     args += " --default-program " + std::to_string(opts["defaultProgram"].get<int>());
@@ -1154,22 +1648,32 @@ bool importMidiGeneric(const std::string& midiPath, const json& opts, std::strin
   std::string cmd = "\"\"" + cli + "\" midi2spc \"" + midiPath + "\" \"" + outSpc.string() +
                     "\" --template \"" + soundBankPath() + "\"" + args + " >nul 2>&1\"";
   if (runHidden(cmd) != 0) {
+    std::filesystem::remove(outSpc, ec);
     err = "GTBoop-cli midi2spc failed (check the MIDI file)";
     return false;
   }
-  return loadSong(outSpc.string(), 0x0D20, err);
+  const bool loaded = loadSong(outSpc.string(), 0x0D20, err);
+  std::filesystem::remove(outSpc, ec);
+  return loaded;
 }
 
 // ---- ROM (Goof Troop .smc/.sfc) ---------------------------------------------
 //
-// Song table: 3-byte LE pointer entries at PC 0x20000 (headerless). Blob at
-// base+pointer (base is 0x18000 or 0x20000 depending on slot) laid out as
-// [seqSize u16LE][aramLoadPtr u16LE][sequence bytes]. Mirrors
-// Tools/Build-GoofTroop-TestRom.ps1.
+// Song table: 3-byte entries at PC 0x20000 (SNES $84:8000, headerless). The
+// game's loader (CODE_8098DC in the disassembly) decodes an entry as
+//   bank   = $84 OR byte2            (an OR, not an add - see reachability)
+//   offset = word AND $7FFF          (index from bank:$8000)
+// so PC = (($84 OR byte2) AND $7F)*$8000 + (word AND $7FFF).
+// CODE_80995C reads another block header after each upload: a song is
+// [size u16LE][ARAM u16LE][payload][0 u16LE][0 u16LE], NOT just its payload.
+// CODE_809928/809937 wrap Y at $8000 and increment the bank, including across
+// banks which cannot themselves be encoded as a table entry's starting bank.
 
 constexpr uint32_t kRomSongTablePc = 0x20000;
 constexpr int kRomSongSlots = 0x30;
-constexpr std::array<uint32_t, 2> kRomPtrBases = {0x18000u, 0x20000u};
+constexpr uint32_t kRomStockSize = 0x80000;     // 512 KB, no free space inside
+constexpr uint32_t kRomMaximumSize = 0x400000; // standard LoROM, no ExLoROM guessing
+constexpr uint8_t kRomBankBase = 0x84;
 
 uint16_t rd16le(const std::vector<uint8_t>& d, uint32_t o) {
   return static_cast<uint16_t>(d[o] | (d[o + 1] << 8));
@@ -1180,37 +1684,168 @@ void wr16le(std::vector<uint8_t>& d, uint32_t o, uint16_t v) {
 }
 
 struct RomSlotInfo {
-  uint32_t blobPc = 0;
+  uint32_t blobPc = 0;  // headerless PC of [size, loadPtr, seq]
   uint16_t seqSize = 0;
   uint16_t loadPtr = 0;
   bool valid = false;
 };
 
-// Resolve slot -> blob location using the same base-candidate heuristic as the
-// PowerShell pipeline (prefer entries whose loadPtr is a sane ARAM address).
+// A start bank must contain all the bits forced by ORA #$84.
+bool romPcReachable(uint32_t pc) {
+  return pc < kRomMaximumSize && ((pc / 0x8000) & 0x04) != 0;
+}
+
 RomSlotInfo resolveRomSlot(const std::vector<uint8_t>& rom, uint32_t hdr, int slot) {
   RomSlotInfo out;
+  if (slot < 0 || slot >= kRomSongSlots || hdr > rom.size()) {
+    return out;
+  }
   const uint32_t entry = hdr + kRomSongTablePc + static_cast<uint32_t>(slot) * 3;
   if (entry + 3 > rom.size()) return out;
-  const uint32_t ptr = rom[entry] | (rom[entry + 1] << 8) | (rom[entry + 2] << 16);
-  for (int pass = 0; pass < 2; ++pass) {
-    for (uint32_t base : kRomPtrBases) {
-      const uint64_t pc = static_cast<uint64_t>(hdr) + base + ptr;
-      if (pc + 4 >= rom.size()) continue;
-      const uint16_t size = rd16le(rom, static_cast<uint32_t>(pc));
-      const uint16_t load = rd16le(rom, static_cast<uint32_t>(pc) + 2);
-      const bool saneSize = size > 0 && size < 0x8000 && pc + 4 + size <= rom.size();
-      const bool saneLoad = load == 0x0D20;
-      if (saneSize && (pass == 1 || saneLoad)) {
-        out.blobPc = static_cast<uint32_t>(pc);
-        out.seqSize = size;
-        out.loadPtr = load;
-        out.valid = true;
-        return out;
-      }
+  const uint16_t word = rd16le(rom, entry);
+  const uint8_t byte2 = rom[entry + 2];
+  const uint64_t pc = static_cast<uint64_t>((byte2 | kRomBankBase) & 0x7F) * 0x8000 + (word & 0x7FFF);
+  const uint64_t filePos = hdr + pc;
+  if (filePos + 4 >= rom.size()) return out;
+  const uint16_t size = rd16le(rom, static_cast<uint32_t>(filePos));
+  const uint16_t load = rd16le(rom, static_cast<uint32_t>(filePos) + 2);
+  if (size == 0 || size > kSongAramCapacity || load != kSongAramBase || filePos + 8 + size > rom.size()) {
+    return out;
+  }
+  // Support only the single-block song format, not driver/SFX/multi-block data.
+  if (!std::all_of(rom.begin() + filePos + 4 + size, rom.begin() + filePos + 8 + size,
+                   [](uint8_t v) { return v == 0; })) {
+    return out;
+  }
+  if (pc < kRomSongTablePc + kRomSongSlots * 3 && kRomSongTablePc < pc + size + 8) {
+    return out;
+  }
+  out.blobPc = static_cast<uint32_t>(pc);
+  out.seqSize = size;
+  out.loadPtr = load;
+  out.valid = true;
+  return out;
+}
+
+void writeRomSlotEntry(std::vector<uint8_t>& rom, uint32_t hdr, int slot, uint32_t blobPc) {
+  const uint32_t entry = hdr + kRomSongTablePc + static_cast<uint32_t>(slot) * 3;
+  wr16le(rom, entry, static_cast<uint16_t>(blobPc & 0x7FFF));
+  rom[entry + 2] = static_cast<uint8_t>((blobPc / 0x8000) & ~kRomBankBase);
+}
+
+// A block this editor relocated a song into: sized for the largest song the
+// ARAM window can hold and tagged at its end, so later exports of that slot can
+// rewrite it in place instead of expanding the ROM again every time. Untagged
+// space is never reclaimed (see allocateRomSpace).
+constexpr char kOwnedBlockTag[8] = {'G', 'T', 'B', 'O', 'O', 'P', 'R', '1'};
+constexpr uint32_t kOwnedBlockSpan = 8 + kSongAramCapacity;  // [size][load][seq][4-byte terminator]
+constexpr uint32_t kOwnedBlockBytes = kOwnedBlockSpan + sizeof(kOwnedBlockTag);
+
+bool isOwnedBlock(const std::vector<uint8_t>& rom, uint32_t hdr, uint32_t blobPc) {
+  const uint64_t tag = static_cast<uint64_t>(hdr) + blobPc + kOwnedBlockSpan;
+  return tag + sizeof(kOwnedBlockTag) <= rom.size() &&
+         std::memcmp(rom.data() + tag, kOwnedBlockTag, sizeof(kOwnedBlockTag)) == 0;
+}
+
+// Existing expansion is opaque, even FF fill: GoofED reserves $94/$95/$96
+// for tile16/tilemaps/graphics (GoofED/ASM/Required/EditorROMMap.txt).
+// Only bytes appended by THIS export (or a block tagged by an earlier one) are
+// owned. Never reclaim anything else.
+uint32_t allocateRomSpace(std::vector<uint8_t>& rom, uint32_t hdr, uint32_t need) {
+  const auto oldSize = static_cast<uint32_t>(rom.size() - hdr);
+  if (oldSize >= kRomMaximumSize) {
+    return 0;
+  }
+  const uint32_t newSize = oldSize * 2;
+  uint32_t pc = oldSize;
+  while (pc < newSize && !romPcReachable(pc)) {
+    pc += 0x8000;
+  }
+  if (pc >= newSize || need > newSize - pc) {
+    return 0;
+  }
+  rom.resize(hdr + newSize, 0xFF);
+  return pc;
+}
+
+bool validateRomLayout(const std::vector<uint8_t>& rom, uint32_t hdr, std::string& err) {
+  const size_t size = rom.size() - hdr;
+  if (size < kRomStockSize || size > kRomMaximumSize || (size & (size - 1)) != 0) {
+    err = "unsupported ROM size: require power-of-two 512 KB to 4 MB LoROM";
+    return false;
+  }
+  if (rom[hdr + 0x7FD5] != 0x20 && rom[hdr + 0x7FD5] != 0x30) {
+    err = "unsupported ROM mapping: require LoROM";
+    return false;
+  }
+  // Entire U loader, PC $18DC-$19B1, matched to local ROM/disassembly.
+  // Other loader revisions require qualification; do not silently guess.
+  const unsigned char loader[] =
+      "\xA6\x9A\xDA\xA2\xFF\x86\x9A\x84\x02\xC2\x30\x29\xFF\x00\x85\x00"
+      "\x0A\x65\x00\xAA\xBF\x00\x80\x84\x29\xFF\x7F\xA8\xA9\x00\x80\x85"
+      "\x10\xE2\x20\xBF\x02\x80\x84\x09\x84\x85\x12\x8A\xF0\x0E\xAF\x09"
+      "\xFF\x7F\xCD\x42\x21\xD0\xFB\xA5\x02\x8D\x40\x21\xC2\x20\xA9\xAA"
+      "\xBB\xCD\x40\x21\xE2\x20\xD0\xEF\xA9\xCC\x80\x34\xB7\x10\xC8\x10"
+      "\x05\xA0\x00\x00\xE6\x12\xEB\xA9\x00\x80\x12\xEB\xB7\x10\xC8\x10"
+      "\x05\xA0\x00\x00\xE6\x12\xEB\xCD\x40\x21\xD0\xFB\x1A\xC2\x20\x8D"
+      "\x40\x21\xE2\x20\xCA\xD0\xE4\xCD\x40\x21\xD0\xFB\x69\x03\xF0\xFC"
+      "\x48\xB7\x10\xEB\xC8\x10\x05\xA0\x00\x00\xE6\x12\xB7\x10\xEB\xAA"
+      "\xC8\x10\x05\xA0\x00\x00\xE6\x12\xB7\x10\xEB\xC8\x10\x05\xA0\x00"
+      "\x00\xE6\x12\xB7\x10\x8D\x43\x21\xC8\x10\x05\xA0\x00\x00\xE6\x12"
+      "\xEB\x8D\x42\x21\xE0\x01\x00\xA9\x00\x2A\x8D\x41\x21\x69\x7F\x68"
+      "\x8D\x40\x21\xCD\x40\x21\xD0\xFB\x70\x82\xE2\x30\xA9\x01\x8F\x09"
+      "\xFF\x7F\x68\x85\x9A\x60";
+  if (std::memcmp(loader, rom.data() + hdr + 0x18DC, sizeof(loader) - 1) != 0) {
+    err = "unsupported ROM song loader: expected qualified Goof Troop U upload routine";
+    return false;
+  }
+  return true;
+}
+
+bool writeFileAtomically(const std::string& path, const std::vector<uint8_t>& rom, std::string& err) {
+  const std::filesystem::path target(path);
+  std::filesystem::path staging;
+  std::error_code ec;
+  for (unsigned i = 0; i < 64; ++i) {
+    staging = target;
+    staging += ".gtb-write-" + std::to_string(_getpid()) + "-" + std::to_string(i);
+    if (std::filesystem::create_directory(staging, ec)) {
+      break;
+    }
+    staging.clear();
+    if (ec && ec != std::errc::file_exists) {
+      break;
     }
   }
-  return out;
+  if (staging.empty()) {
+    err = "cannot stage the file beside its destination";
+    return false;
+  }
+  const auto temporary = staging / "image.tmp";
+  bool written = false;
+  {
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(rom.data()), static_cast<std::streamsize>(rom.size()));
+    out.flush();
+    written = out.good();
+    out.close();
+    written = written && !out.fail();
+  }
+  if (written) {
+#ifdef _WIN32
+    written = MoveFileExW(temporary.c_str(), target.c_str(),
+                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    std::filesystem::rename(temporary, target, ec);
+    written = !ec;
+#endif
+  }
+  std::filesystem::remove(temporary, ec);
+  std::filesystem::remove(staging, ec);
+  if (!written) {
+    err = "cannot atomically replace the file; destination was not changed";
+  }
+  return written;
 }
 
 void updateSnesChecksum(std::vector<uint8_t>& rom, uint32_t hdr) {
@@ -1231,9 +1866,13 @@ bool openRomSong(const std::string& path, int slot, std::string& err) {
   if (!in) { err = "cannot open ROM"; return false; }
   std::vector<uint8_t> rom((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   const uint32_t hdr = (rom.size() % 0x8000) == 512 ? 512 : 0;
+  if (!validateRomLayout(rom, hdr, err)) {
+    return false;
+  }
   auto info = resolveRomSlot(rom, hdr, slot);
   if (!info.valid) { err = "cannot resolve song slot " + std::to_string(slot); return false; }
-  std::vector<uint8_t> seq(rom.begin() + info.blobPc + 4, rom.begin() + info.blobPc + 4 + info.seqSize);
+  std::vector<uint8_t> seq(rom.begin() + hdr + info.blobPc + 4,
+                           rom.begin() + hdr + info.blobPc + 4 + info.seqSize);
   if (!loadSequenceImage(seq, info.loadPtr, std::filesystem::path(path).filename().string() +
                                                 " [slot " + std::to_string(slot) + "]", err)) {
     return false;
@@ -1243,16 +1882,23 @@ bool openRomSong(const std::string& path, int slot, std::string& err) {
   rc->headerOffset = hdr;
   rc->slot = slot;
   rc->blobPc = info.blobPc;
-  rc->capacity = info.seqSize;  // in-place rewrite may not grow past the original blob
+  rc->capacity = info.seqSize;  // in-place rewrite limit; beyond it export relocates
   rc->origSeq = seq;
   rc->path = path;
   g_session->rom = std::move(rc);
   return true;
 }
 
+struct RomExportResult {
+  bool relocated = false;
+  uint32_t blobPc = 0;
+  size_t romSize = 0;
+};
+
 // Write the current sequence into a ROM slot and save to `outPath`. Uses the
 // ROM the song came from unless `romPath` overrides it.
-bool exportRomSong(const std::string& romPath, int slot, const std::string& outPath, std::string& err) {
+bool exportRomSong(const std::string& romPath, int slot, const std::string& outPath, std::string& err,
+                   RomExportResult* result = nullptr) {
   std::vector<uint8_t> image;
   uint32_t base;
   bool prio;
@@ -1276,37 +1922,91 @@ bool exportRomSong(const std::string& romPath, int slot, const std::string& outP
   }
   if (slot < 0) { err = "slot required"; return false; }
 
+  if (!validateRomLayout(rom, hdr, err)) {
+    return false;
+  }
+
   auto info = resolveRomSlot(rom, hdr, slot);
   if (!info.valid) { err = "cannot resolve song slot " + std::to_string(slot); return false; }
-  if (image.size() > info.seqSize) {
-    err = "sequence (" + std::to_string(image.size()) + " bytes) exceeds slot capacity (" +
-          std::to_string(info.seqSize) + "); choose a larger slot";
+  if (base != kSongAramBase || prio || image.empty() || image.size() > kSongAramCapacity) {
+    err = "sequence (" + std::to_string(image.size()) + " bytes) exceeds the ARAM song window (" +
+          std::to_string(kSongAramCapacity) + " bytes)";
     return false;
+  }
+  // Copy on write for aliases/overlapping song blobs. A table entry does not
+  // establish exclusive ownership of the bytes it references.
+  bool shared = false;
+  for (int s = 0; s < kRomSongSlots; ++s) {
+    if (s == slot) {
+      continue;
+    }
+    const auto other = resolveRomSlot(rom, hdr, s);
+    if (other.valid && info.blobPc < other.blobPc + other.seqSize + 8 &&
+        other.blobPc < info.blobPc + info.seqSize + 8) {
+      shared = true;
+    }
+  }
+  const bool unchanged = image.size() <= info.seqSize && base == info.loadPtr &&
+      std::equal(image.begin(), image.end(), rom.begin() + hdr + info.blobPc + 4);
+  // A block we tagged on an earlier export can grow in place up to the window.
+  const bool owned = !shared && isOwnedBlock(rom, hdr, info.blobPc);
+  const size_t inPlaceCapacity = owned ? kSongAramCapacity : info.seqSize;
+  bool relocated = false;
+  if (image.size() > inPlaceCapacity || (!unchanged && shared)) {
+    const uint32_t pc = allocateRomSpace(rom, hdr, kOwnedBlockBytes);
+    if (pc == 0) {
+      err = "no safely owned space: existing expansion is reserved and ROM cannot expand further";
+      return false;
+    }
+    // Claim the whole block: zero it (the terminator and any later growth
+    // must read as zeros) and tag it so the next export reuses it.
+    std::fill(rom.begin() + hdr + pc, rom.begin() + hdr + pc + kOwnedBlockSpan, 0);
+    std::memcpy(rom.data() + hdr + pc + kOwnedBlockSpan, kOwnedBlockTag, sizeof(kOwnedBlockTag));
+    writeRomSlotEntry(rom, hdr, slot, pc);
+    relocated = true;
+    info.blobPc = pc;
+    info.seqSize = static_cast<uint16_t>(image.size());
+    info.loadPtr = static_cast<uint16_t>(base);
   }
   // If the song is unchanged from what the selected template slot already
   // stores (possibly plus tail padding counted in the size field), leave the
   // slot byte-for-byte alone. This must also work when the UI passes the same
   // ROM explicitly instead of relying on the open-ROM session context.
-  const auto slotBegin = rom.begin() + info.blobPc + 4;
+  const auto slotBegin = rom.begin() + hdr + info.blobPc + 4;
   const bool unchangedPrefix = image.size() <= info.seqSize && base == info.loadPtr &&
                                std::equal(image.begin(), image.end(), slotBegin);
-  if (!unchangedPrefix) {
-    wr16le(rom, info.blobPc, static_cast<uint16_t>(image.size()));
-    wr16le(rom, info.blobPc + 2, static_cast<uint16_t>(base));
-    std::copy(image.begin(), image.end(), rom.begin() + info.blobPc + 4);
-    // Zero the slot's tail so stale bytes from the previous song don't leak.
-    std::fill(rom.begin() + info.blobPc + 4 + image.size(),
-              rom.begin() + info.blobPc + 4 + info.seqSize, 0);
+  if (!unchangedPrefix || relocated) {
+    wr16le(rom, hdr + info.blobPc, static_cast<uint16_t>(image.size()));
+    wr16le(rom, hdr + info.blobPc + 2, static_cast<uint16_t>(base));
+    std::copy(image.begin(), image.end(), rom.begin() + hdr + info.blobPc + 4);
+    // Include the zero-size/zero-entry terminating block, also when shrinking.
+    // (When an owned block grew in place, the old size is the smaller one.)
+    const size_t clearTo = 8 + std::max<size_t>(info.seqSize, image.size());
+    std::fill(rom.begin() + hdr + info.blobPc + 4 + image.size(),
+              rom.begin() + hdr + info.blobPc + clearTo, 0);
   }
+  uint8_t sizeCode = 9;
+  for (size_t size = kRomStockSize; size < rom.size() - hdr; size *= 2) {
+    ++sizeCode;
+  }
+  rom[hdr + 0x7FD7] = sizeCode;
   updateSnesChecksum(rom, hdr);
-
-  std::ofstream o(outPath, std::ios::binary | std::ios::trunc);
-  if (!o) { err = "cannot write ROM"; return false; }
-  o.write(reinterpret_cast<const char*>(rom.data()), static_cast<std::streamsize>(rom.size()));
+  if (!writeFileAtomically(outPath, rom, err)) {
+    return false;
+  }
+  if (result) {
+    result->relocated = relocated;
+    result->romSize = rom.size() - hdr;
+    result->blobPc = info.blobPc;
+  }
   return true;
 }
 
-json handle(const json& req) {
+// By value on purpose: const json::operator[] on a missing key is undefined
+// behaviour (it can crash the engine and lose unsaved work). On a mutable copy
+// a missing field reads as null, and converting null to a number or string
+// throws json::type_error, which main() reports as a normal error response.
+json handle(json req) {
   json resp;
   resp["id"] = req.value("id", 0);
   const std::string cmd = req.value("cmd", "");
@@ -1321,6 +2021,14 @@ json handle(const json& req) {
   };
   auto model = [&]() -> CapcomPianoRollModel* { return g_session ? g_session->model.get() : nullptr; };
 
+  // Compound note edits may erase, optimize, insert and restore a program.
+  // Both standalone edits and nested group edits must preserve the whole
+  // history on failure, and create only one undo entry on success.
+  std::unique_ptr<CapcomPianoRollModel::EditTransaction> noteTransaction;
+  if (model() && (cmd == "placeNote" || cmd == "resizeNote" || cmd == "moveNote" || cmd == "insertNote")) {
+    noteTransaction = std::make_unique<CapcomPianoRollModel::EditTransaction>(*model());
+  }
+
   bool ok = false;
   if (cmd == "open") {
     uint32_t base = 0x0D20;
@@ -1330,34 +2038,104 @@ json handle(const json& req) {
     std::string path = req.value("path", "");
     if (path.empty()) path = soundBankPath();  // default song (bundled soundbank)
     ok = loadSong(path, base, err);
+    if (ok && req.contains("path")) {
+      g_session->userPath = path;
+    }
   } else if (cmd == "state") {
     ok = need(true);
+  } else if (cmd == "moveNotes" && need(true)) {
+    CapcomPianoRollModel::EditTransaction transaction(*model());
+    auto items = req.at("items");
+    const int deltaTick = req.at("dTick");
+    const int deltaPitch = req.at("dPitch");
+    if (!items.is_array() || items.empty() || items.size() > 4096) {
+      err = "moveNotes requires 1..4096 note references";
+    } else {
+      std::sort(items.begin(), items.end(), [deltaTick](const json& a, const json& b) {
+        return deltaTick > 0 ? a.at("tick") > b.at("tick") : a.at("tick") < b.at("tick");
+      });
+      ok = true;
+      for (const auto& item : items) {
+        const int track = item.at("track");
+        const int sourceTick = item.at("tick");
+        const int sourcePitch = item.at("pitch");
+        const int64_t targetTick = static_cast<int64_t>(sourceTick) + deltaTick;
+        const int64_t targetPitch = static_cast<int64_t>(sourcePitch) + deltaPitch;
+        const auto* data = model()->trackData(track);
+        int note = -1;
+        if (data) {
+          for (size_t i = 0; i < data->notes.size(); ++i) {
+            const auto& n = data->notes[i];
+            if (!n.isRest && n.startTick == sourceTick && n.midiKey == sourcePitch) {
+              note = static_cast<int>(i);
+              break;
+            }
+          }
+        }
+        if (note < 0 || targetTick < 0 || targetTick > UINT32_MAX || targetPitch < 0 || targetPitch > 127) {
+          ok = false;
+          err = "Group move contains a missing note or out-of-range destination";
+          break;
+        }
+        const auto moved = handle({{"cmd", "placeNote"}, {"track", track}, {"note", note},
+                                   {"tick", targetTick}, {"pitch", targetPitch}});
+        if (!moved.value("ok", false)) {
+          ok = false;
+          err = moved.value("error", "Group move failed");
+          break;
+        }
+      }
+      if (ok) ok = transaction.commit(&err);
+    }
+    if (!ok) {
+      std::string rollbackError;
+      if (!transaction.rollback(&rollbackError)) err += "; " + rollbackError;
+    }
+  } else if (cmd == "replaceLoop" && need(true)) {
+    CapcomPianoRollModel::EditTransaction transaction(*model());
+    ok = model()->removeLoop(req.at("track"), req.at("loop"), &err) &&
+        model()->createLoop(req.at("track"), req.at("startTick"), req.at("endTick"),
+                            req.value("slot", 0), req.value("count", 2), &err);
+    if (ok) ok = transaction.commit(&err);
+    if (!ok) {
+      std::string rollbackError;
+      if (!transaction.rollback(&rollbackError)) err += "; " + rollbackError;
+    }
   } else if (cmd == "setNote" && need(true)) {
     ok = model()->applyEdit(req["track"], req["note"], req.value("pitch", 60), req.value("len", 12u),
                             req.value("rest", false), &err);
   } else if (cmd == "insertNote" && need(true)) {
-    ok = model()->InsertNoteAtTick(req["track"], req["tick"], req.value("pitch", 60),
-                                   req.value("len", 12u), nullptr, nullptr, &err);
-    if (!ok && err.find("No event at this position") != std::string::npos) {
-      // past the track's end (or the track is empty): append instead
+    const int track = req.at("track").get<int>();
+    const uint32_t tick = req.at("tick").get<uint32_t>();
+    const int pitch = req.value("pitch", 60);
+    const uint32_t len = req.value("len", 12u);
+    // Past the end of the track - or past its loop point, where the parser's
+    // replayed events no longer count as occupied - there is "no event"; append
+    // there instead (for a looping track that extends the looped body).
+    auto place = [&]() {
       err.clear();
-      ok = model()->AppendNoteAtTick(req["track"], req["tick"], req.value("pitch", 60),
-                                     req.value("len", 12u), &err);
-    }
+      if (model()->InsertNoteAtTick(track, tick, pitch, len, nullptr, nullptr, &err)) {
+        return true;
+      }
+      if (err.find("No event at this position") == std::string::npos) {
+        return false;
+      }
+      err.clear();
+      return model()->AppendNoteAtTick(track, tick, pitch, len, &err);
+    };
+    ok = place();
     if (!ok && err.find("bytes are allocated") != std::string::npos) {
       // over budget: reclaim bytes (merge rests, drop dead settings), retry once
       uint32_t b0 = 0, b1 = 0;
       std::string optErr;
       if (verifiedOptimize(&b0, &b1, &optErr) && b1 < b0) {
-        err.clear();
-        ok = model()->InsertNoteAtTick(req["track"], req["tick"], req.value("pitch", 60),
-                                       req.value("len", 12u), nullptr, nullptr, &err);
-        if (!ok && err.find("No event at this position") != std::string::npos) {
-          err.clear();
-          ok = model()->AppendNoteAtTick(req["track"], req["tick"], req.value("pitch", 60),
-                                         req.value("len", 12u), &err);
-        }
+        ok = place();
       }
+    }
+    // "outside" places the note past the loop point AND ends the song's loop,
+    // so the loop plays through once, then the appended note, then stops.
+    if (ok && req.value("loopMode", std::string()) == "outside") {
+      if (!model()->endSongLoops(&err)) ok = false;
     }
   } else if (cmd == "moveNote" && need(true)) {
     ok = model()->MoveNote(req["track"], req["note"], req["tick"], req["pitch"], nullptr, &err);
@@ -1398,10 +2176,10 @@ json handle(const json& req) {
           std::string e2;
           if (!m->eraseNotes({{fromTrack, noteIdx}}, &e2)) continue;
           uint32_t insertedTick = 0;
-          bool placed = m->InsertNoteAtTick(t, tick, pitch, note.deltaTicks, &insertedTick, nullptr, &e2);
+          bool placed = m->InsertNoteAtTick(t, tick, pitch, note.deltaTicks, &insertedTick, nullptr, &e2, &note);
           if (!placed && e2.find("No event at this position") != std::string::npos) {
             e2.clear();
-            placed = m->AppendNoteAtTick(t, tick, pitch, note.deltaTicks, &e2);
+            placed = m->AppendNoteAtTick(t, tick, pitch, note.deltaTicks, &e2, &note);
             insertedTick = tick;
           }
           if (placed) {
@@ -1411,7 +2189,12 @@ json handle(const json& req) {
               for (size_t i = 0; i < dst->notes.size(); ++i) {
                 if (!dst->notes[i].isRest && dst->notes[i].startTick == insertedTick) {
                   if (dst->notes[i].program != note.program) {
-                    m->setInstrument({{t, static_cast<int>(i)}}, note.program, &e2);
+                    if (!m->setInstrument({{t, static_cast<int>(i)}}, note.program, &e2)) {
+                      err = "Relocated note could not preserve its instrument: " + e2;
+                      resp["ok"] = false;
+                      resp["error"] = err;
+                      return resp;  // transaction destructor restores the complete edit
+                    }
                   }
                   resp["movedNote"] = i;
                   break;
@@ -1442,14 +2225,18 @@ json handle(const json& req) {
       err = "invalid note";
     } else {
       const auto note = data->notes[static_cast<size_t>(noteIdx)];
-      if (m->eraseNotes({{track, noteIdx}}, &err)) {
+      if (newLen == note.deltaTicks) {
+        // Preserve the original encoding and articulation, including every
+        // segment of a tie. A no-op must not consume the previous Undo.
+        ok = true;
+      } else if (m->eraseNotes({{track, noteIdx}}, &err)) {
         uint32_t insertedTick = 0;
         ok = m->InsertNoteAtTick(track, note.startTick, note.midiKey, newLen,
                                  &insertedTick, nullptr, &err);
         if (!ok && err.find("bytes are allocated") != std::string::npos) {
           uint32_t b0 = 0, b1 = 0;
           std::string optErr;
-          if (m->optimizeSequence(&b0, &b1, &optErr) && b1 < b0) {
+          if (verifiedOptimize(&b0, &b1, &optErr) && b1 < b0) {
             err.clear();
             ok = m->InsertNoteAtTick(track, note.startTick, note.midiKey, newLen,
                                      &insertedTick, nullptr, &err);
@@ -1464,10 +2251,10 @@ json handle(const json& req) {
     }
   } else if (cmd == "setInstrument" && need(true)) {
     std::vector<std::pair<int, int>> refs;
-    for (const auto& r : req["notes"]) {
-      refs.emplace_back(r["track"].get<int>(), r["note"].get<int>());
+    for (const auto& r : req.at("notes")) {  // a missing list is an error, not a silent no-op
+      refs.emplace_back(r.at("track").get<int>(), r.at("note").get<int>());
     }
-    ok = model()->setInstrument(refs, req["program"].get<int>(), &err);
+    ok = model()->setInstrument(refs, req.at("program").get<int>(), &err);
   } else if (cmd == "eraseNote" && need(true)) {
     std::vector<std::pair<int, int>> refs{{req["track"].get<int>(), req["note"].get<int>()}};
     ok = model()->eraseNotes(refs, &err);
@@ -1489,6 +2276,7 @@ json handle(const json& req) {
       }
     }
   } else if (cmd == "optimize" && need(true)) {
+    CapcomPianoRollModel::EditTransaction transaction(*model());
     uint32_t beforeB = 0, afterB = 0;
     ok = verifiedOptimize(&beforeB, &afterB, &err);
     int mergedTracks = 0;
@@ -1496,10 +2284,10 @@ json handle(const json& req) {
       // fold same-instrument tracks with non-overlapping notes together;
       // repeat until no candidate pair merges
       bool progress = true;
-      while (progress) {
+      while (progress && ok) {
         progress = false;
         auto* m = model();
-        for (int src = m->trackCount() - 1; src > 0 && !progress; --src) {
+        for (int src = m->trackCount() - 1; src > 0 && !progress && ok; --src) {
           const auto* sd = m->trackData(src);
           if (!sd || sd->notes.empty() || !sd->loops.empty()) continue;
           int prog = -1;
@@ -1511,7 +2299,7 @@ json handle(const json& req) {
             else if (prog != n.program) { oneProg = false; break; }
           }
           if (!anyNote || !oneProg) continue;
-          for (int dst = 0; dst < src && !progress; ++dst) {
+          for (int dst = 0; dst < src && !progress && ok; ++dst) {
             const auto* dd = m->trackData(dst);
             if (!dd || !dd->loops.empty()) continue;
             int dprog = -1;
@@ -1537,12 +2325,26 @@ json handle(const json& req) {
             if (mergeTracksInto(src, dst, &mergeErr)) {
               ++mergedTracks;
               progress = true;
+            } else {
+              // A merge can fail after inserting several notes. Never keep
+              // those partial edits or continue with invalidated track views.
+              ok = false;
+              err = mergeErr;
             }
           }
         }
       }
-      if (mergedTracks > 0) {
-        verifiedOptimize(nullptr, &afterB, &err);
+      if (ok && mergedTracks > 0) {
+        ok = verifiedOptimize(nullptr, &afterB, &err);
+      }
+    }
+    if (ok) {
+      ok = transaction.commit(&err);
+    }
+    if (!ok) {
+      std::string rollbackErr;
+      if (!transaction.rollback(&rollbackErr)) {
+        err += " (" + rollbackErr + ")";
       }
     }
     if (ok) {
@@ -1568,7 +2370,7 @@ json handle(const json& req) {
   } else if (cmd == "redo" && need(true)) {
     ok = model()->redo(&err);
   } else if (cmd == "save" && need(true)) {
-    ok = saveSong(req.value("path", g_session->sourcePath.string()), err);
+    ok = saveSong(req.value("path", g_session->userPath.string()), err);
   } else if (cmd == "saveSession" && need(true)) {
     // .gtb session: JSON wrapping the SPC bytes plus editor extras (ghost
     // notes etc.) that have no representation in the SPC itself
@@ -1579,13 +2381,15 @@ json handle(const json& req) {
       doc["version"] = 1;
       doc["spcBase64"] = base64Encode(spc);
       // carry the byte allocation: a reopened session must keep the room the
-      // song had (a new song's 1388-byte floor, not its current footprint)
+      // song had (the ARAM song window, not its current footprint)
       uint32_t used = 0, budget = 0;
       if (g_session->model->byteUsage(&used, &budget)) doc["allocation"] = budget;
       if (req.contains("extra")) doc["extra"] = req["extra"];
-      std::ofstream out(std::filesystem::path(req["path"].get<std::string>()), std::ios::binary);
-      if (out) { out << doc.dump(); ok = true; }
-      else err = "cannot write session file";
+      // atomic: a failed write (disk full, locked file) must neither truncate
+      // the existing session nor report success
+      const std::string text = doc.dump();
+      ok = writeFileAtomically(req.at("path").get<std::string>(),
+                               std::vector<uint8_t>(text.begin(), text.end()), err);
     }
   } else if (cmd == "openSession") {
     std::ifstream in(std::filesystem::path(req["path"].get<std::string>()), std::ios::binary);
@@ -1599,13 +2403,18 @@ json handle(const json& req) {
         if (!base64Decode(doc.value("spcBase64", ""), spc)) {
           err = "corrupt session payload";
         } else {
-          auto tmp = std::filesystem::temp_directory_path() / "gtb-session-open.spc";
+          auto tmp = operationTempPath("session", ".spc");
           std::ofstream out(tmp, std::ios::binary);
           out.write(reinterpret_cast<const char*>(spc.data()), static_cast<std::streamsize>(spc.size()));
           out.close();
           ok = loadSong(tmp.string(), 0x0D20, err);
+          std::error_code cleanupError;
+          std::filesystem::remove(tmp, cleanupError);
           if (ok && doc.contains("allocation") && g_session && g_session->model) {
-            g_session->model->setAllocationFloor(doc["allocation"].get<uint32_t>());
+            // never shrink below the ARAM capacity: older sessions carried the
+            // 1388-byte new-song floor from before relocation existed
+            g_session->model->setAllocationFloor(
+                std::max(doc["allocation"].get<uint32_t>(), kSongAramCapacity));
           }
           if (ok && doc.contains("extra")) resp["extra"] = doc["extra"];
         }
@@ -1638,14 +2447,28 @@ json handle(const json& req) {
         }
       }
     }
+  } else if (cmd == "setAllocationFloor" && need(true)) {
+    // Diagnostic: pin the byte budget (0 = the song's own footprint). Lets the
+    // test suite exercise over-budget rejection now that real songs get the
+    // whole ARAM window.
+    // (the IR only ever raises its allocation, so rebuild it from the raw)
+    g_session->model->setAllocationFloor(req.value("bytes", 0u));
+    ok = g_session->model->reload();
+    if (!ok) err = "model reload failed";
   } else if (cmd == "openRom") {
     ok = openRomSong(req.value("path", std::string()), req.value("slot", 0x15), err);
   } else if (cmd == "exportRom" && need(true)) {
     const std::string outPath = req.value("path", std::string());
     if (outPath.empty()) { err = "path required"; }
-    else if (exportRomSong(req.value("rom", std::string()), req.value("slot", -1), outPath, err)) {
-      resp["path"] = outPath;
-      ok = true;
+    else {
+      RomExportResult r;
+      if (exportRomSong(req.value("rom", std::string()), req.value("slot", -1), outPath, err, &r)) {
+        resp["path"] = outPath;
+        resp["relocated"] = r.relocated;
+        resp["blobPc"] = r.blobPc;
+        resp["romSize"] = r.romSize;
+        ok = true;
+      }
     }
   } else if (cmd == "listRomSongs") {
     std::ifstream in(req.value("path", std::string()), std::ios::binary);
@@ -1655,14 +2478,15 @@ json handle(const json& req) {
       rom.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
       const uint32_t hdr = (rom.size() % 0x8000) == 512 ? 512 : 0;
       json slotArr = json::array();
-      for (int s = 0; s < kRomSongSlots; ++s) {
+      const bool supported = validateRomLayout(rom, hdr, err);
+      for (int s = 0; supported && s < kRomSongSlots; ++s) {
         auto info = resolveRomSlot(rom, hdr, s);
         if (info.valid && info.loadPtr == 0x0D20) {
           slotArr.push_back({{"slot", s}, {"size", info.seqSize}});
         }
       }
       resp["slots"] = slotArr;
-      ok = true;
+      ok = supported;
     }
   } else if (cmd == "exportAsm" && need(true)) {
     std::string text;
@@ -1677,7 +2501,48 @@ json handle(const json& req) {
         ok = true;
       }
     }
-  } else if (cmd == "importAsm") {
+  } else if (cmd == "inspectAsmRepair") {
+    std::string text = req.value("asm", std::string());
+    if (text.empty()) {
+      std::ifstream in(req.value("path", std::string()), std::ios::binary);
+      if (!in) { err = "cannot read ASM file"; }
+      else text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    std::ifstream source(req.value("sourceRom", std::string()), std::ios::binary | std::ios::ate);
+    if (!source || source.tellg() <= 0 || source.tellg() > 8 * 1024 * 1024) {
+      err = "Source ROM must be readable and at most 8 MiB";
+    }
+    if (err.empty()) {
+      const auto size = static_cast<size_t>(source.tellg());
+      std::vector<uint8_t> rom(size);
+      source.seekg(0);
+      source.read(reinterpret_cast<char*>(rom.data()), static_cast<std::streamsize>(size));
+      uint32_t base = 0;
+      std::vector<uint8_t> bytes, repaired;
+      std::map<uint32_t, unsigned> lines;
+      json repairReport, importReport;
+      if (!source) {
+        err = "Source ROM read failed";
+      } else if (assembleAsm(text, base, bytes, err, &lines) &&
+                 AsmSourceRepair::Propose(text, bytes, base, lines, rom, repaired, repairReport, err) &&
+                 prepareAsmImport(repaired, base, json::array(), true, importReport, err)) {
+        std::ostringstream proposed;
+        proposed << ".base $0D20\n" << std::hex << std::uppercase << std::setfill('0');
+        for (size_t offset = 0; offset < repaired.size(); ++offset) {
+          proposed << (offset % 16 == 0 ? "db $" : ",$") << std::setw(2) << unsigned(repaired[offset]);
+          if (offset % 16 == 15 || offset + 1 == repaired.size()) { proposed << '\n'; }
+        }
+        resp["asm"] = proposed.str();
+        resp["asmReport"] = importReport;
+        resp["repairReport"] = repairReport;
+        ok = true; // A proposal only: the live song and undo stack are untouched.
+      }
+      if (!ok && !repairReport.is_null()) {
+        repairReport["validated"] = false;
+        resp["repairReport"] = repairReport;
+      }
+    }
+  } else if (cmd == "importAsm" || cmd == "inspectAsm") {
     std::string text = req.value("asm", std::string());
     if (text.empty() && req.contains("path")) {
       std::ifstream in(req["path"].get<std::string>(), std::ios::binary);
@@ -1687,9 +2552,16 @@ json handle(const json& req) {
     if (err.empty()) {
       uint32_t base;
       std::vector<uint8_t> bytes;
+      json report;
       if (assembleAsm(text, base, bytes, err) &&
-          loadSequenceImage(bytes, base, req.value("name", std::string("imported.asm")), err)) {
-        ok = true;
+          prepareAsmImport(bytes, base, req.value("programMap", json::array()), cmd == "inspectAsm", report, err)) {
+        resp["asmReport"] = report;
+        if (cmd == "inspectAsm") {
+          resp["asm"] = text;  // UI imports the reviewed text, not a potentially changed file.
+          ok = true;
+        } else {
+          ok = loadSequenceImage(bytes, base, req.value("name", std::string("imported.asm")), err);
+        }
       }
     }
   } else if (cmd == "exportMidi" && need(true)) {
@@ -1731,7 +2603,7 @@ json handle(const json& req) {
         const auto wp = renderToTemp(wav, "song");
         const std::string dest = req.value("path", std::string());
         const std::filesystem::path mp =
-            dest.empty() ? std::filesystem::temp_directory_path() / "gtb-render-song.mp3"
+            dest.empty() ? operationTempPath("render", ".mp3")
                          : std::filesystem::path(dest);
         if (wavToMp3(wp, mp, req.value("bitrate", std::string("192k")), err)) {
           resp["mp3"] = mp.string();
@@ -1763,11 +2635,8 @@ json handle(const json& req) {
     seq.insert(seq.end(), t0.begin(), t0.end());
     for (int i = 0; i < 7; ++i) seq.push_back(0x17);
     ok = loadSequenceImage(seq, base, "untitled (new song)", err);
-    // A new song may grow into the space the game reserves for its largest
-    // stock song (1388 bytes, ROM slot 20) instead of its own tiny footprint.
-    if (ok && g_session && g_session->model) {
-      g_session->model->setAllocationFloor(1388);
-    }
+    // (loadSequenceImage applied the ARAM capacity floor, so a new song may
+    // grow to the full $0D20..$4000 window rather than its tiny footprint.)
   } else if (cmd == "previewKey" && need(true)) {
     // Sound a key at a given MIDI pitch with a given instrument (piano keys).
     const int pitch = req.value("pitch", 60);
@@ -1808,6 +2677,13 @@ json handle(const json& req) {
     err = "unknown or invalid command: " + cmd;
   }
 
+  if (noteTransaction) {
+    if (ok) ok = noteTransaction->commit(&err);
+    if (!ok) {
+      std::string rollbackError;
+      if (!noteTransaction->rollback(&rollbackError)) err += "; " + rollbackError;
+    }
+  }
   resp["ok"] = ok;
   if (!ok) {
     resp["error"] = err.empty() ? "failed" : err;

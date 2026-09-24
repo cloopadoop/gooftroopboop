@@ -29,5 +29,6 @@ public:
   static bool Traverse(RawFile *raw,
                        uint32_t trackStart,
                        CapcomTrackTraversalResult *out,
-                       std::string *error = nullptr);
+                       std::string *error = nullptr,
+                       bool verifyControlFlow = false);
 };

@@ -38,7 +38,8 @@ body {
 }
 .brand { display: flex; align-items: center; gap: 10px; flex: none; }
 .brand-mark {
-  width: 26px; height: 27px; image-rendering: pixelated;
+  /* 32 CSS px; srcset supplies a pixel-exact image for 1x/1.25x/1.5x/2x displays */
+  width: 32px; height: 32px; image-rendering: pixelated;
 }
 .brand-name { font-size: 15px; letter-spacing: 0.2px; white-space: nowrap; }
 .brand-name b { font-weight: 700; }
@@ -53,7 +54,17 @@ body {
 .menu.show { display: block; }
 .menu-sep { height: 1px; background: var(--line); margin: 6px 4px; }
 .menu-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--text-dim); padding: 4px 12px 2px; }
+
 .file-menu { min-width: 170px; }
+.songs-menu { min-width: 190px; max-height: 60vh; overflow-y: auto; }
+.songs-menu .song-row {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  width: 100%; text-align: left; cursor: pointer;
+}
+.songs-menu .song-row .cap { color: var(--text-dim); font-size: 11px; font-variant-numeric: tabular-nums; }
+.songs-menu .song-row.current { color: var(--accent); font-weight: 700; }
+.songs-menu .song-row.current::before { content: "▶ "; font-size: 9px; }
+
 .menu button {
   display: block; width: 100%; text-align: left;
   padding: 7px 10px; border: none; border-radius: 7px;
@@ -101,6 +112,10 @@ body {
 .icon-btn:hover, .text-btn:hover { background: var(--panel-2); border-color: #3d4557; }
 .icon-btn:active, .text-btn:active { transform: translateY(1px); }
 .icon-btn.play { color: var(--good); }
+.snap-select {
+  height: 32px; padding: 0 6px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel); color: var(--text); font-size: 12px; cursor: pointer;
+}
 .icon-btn:disabled { opacity: 0.4; cursor: default; }
 .budget { color: var(--text-dim); font-variant-numeric: tabular-nums; min-width: 150px; text-align: right; }
 .budget.warn { color: var(--warn); }

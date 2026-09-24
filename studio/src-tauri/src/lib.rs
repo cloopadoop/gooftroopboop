@@ -5,9 +5,14 @@
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::State;
+
+// Prefix of every error after which the sidecar was dropped: the next request
+// starts a fresh engine with no song loaded. The frontend keys its crash
+// recovery (reload the song, then retry) on this exact prefix.
+const ENGINE_RESTARTED: &str = "engine restarted";
 
 struct Engine {
     child: Option<Child>,
@@ -28,10 +33,15 @@ impl Engine {
         if dir.join("gtb-engine.exe").exists() {
             return Some(dir);
         }
-        // Dev fallback: the repo's src-tauri/bin next to the manifest.
-        let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin");
-        if dev.join("gtb-engine.exe").exists() {
-            return Some(dev);
+        // Dev fallback: the repo's src-tauri/bin next to the manifest. Debug
+        // builds only: in a release/portable build it would hide missing
+        // bundled sidecars on the build machine.
+        #[cfg(debug_assertions)]
+        {
+            let dev = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bin");
+            if dev.join("gtb-engine.exe").exists() {
+                return Some(dev);
+            }
         }
         None
     }
@@ -107,10 +117,12 @@ impl Engine {
             }
             Err(_) => Err("engine response timed out or worker closed".into()),
         };
-        if result.is_err() {
+        // Any transport failure leaves the protocol out of sync: kill the child
+        // (which also unblocks a timed-out reader/writer) and say so distinctly.
+        let result = result.map_err(|e| {
             self.reset();
-        }
-        // reset kills a timed-out child, unblocking its reader/writer.
+            format!("{ENGINE_RESTARTED}: {e}")
+        });
         let _ = worker.join();
         result
     }
@@ -186,7 +198,7 @@ mod tests {
     fn malformed_response_clears_process_without_echoing_payload() {
         let mut engine = fixture("invalid");
         let error = engine.request(json!({})).unwrap_err();
-        assert!(error.starts_with("bad engine response:"));
+        assert!(error.starts_with("engine restarted: bad engine response:"));
         assert!(!error.contains("fixture-private-sentinel"));
         assert!(engine.child.is_none() && engine.stdin.is_none() && engine.reader.is_none());
     }
@@ -194,7 +206,7 @@ mod tests {
     #[test]
     fn eof_clears_process() {
         let mut engine = fixture("eof");
-        assert!(engine.request(json!({})).is_err());
+        assert!(engine.request(json!({})).unwrap_err().starts_with(ENGINE_RESTARTED));
         assert!(engine.child.is_none());
     }
 
@@ -203,7 +215,7 @@ mod tests {
         let mut engine = fixture("echo");
         engine.child.as_mut().unwrap().kill().unwrap();
         engine.child.as_mut().unwrap().wait().unwrap();
-        assert!(engine.request(json!({"cmd":"state"})).is_err());
+        assert!(engine.request(json!({"cmd":"state"})).unwrap_err().starts_with(ENGINE_RESTARTED));
         assert!(engine.child.is_none() && engine.stdin.is_none() && engine.reader.is_none());
     }
 
@@ -212,7 +224,7 @@ mod tests {
         let mut engine = fixture("hang");
         let start = std::time::Instant::now();
         let error = engine.request_with_timeout(json!({}), Duration::from_millis(100)).unwrap_err();
-        assert!(error.contains("timed out"));
+        assert!(error.starts_with(ENGINE_RESTARTED) && error.contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(engine.child.is_none() && engine.stdin.is_none() && engine.reader.is_none());
     }
@@ -223,16 +235,29 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+// One engine shared by all requests; they serialize on the mutex.
+type SharedEngine = Arc<Mutex<Engine>>;
+
+// Async so the window never freezes: renders and exports can take up to the
+// 120 s deadline, so the pipe I/O (and the wait for the lock) runs on a
+// blocking worker thread instead of the main thread.
 #[tauri::command]
-fn engine_request(state: State<Mutex<Engine>>, request: Value) -> Result<Value, String> {
-    state.lock().unwrap().request(request)
+async fn engine_request(state: State<'_, SharedEngine>, request: Value) -> Result<Value, String> {
+    let engine = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        // a panicked request must not brick every later one
+        let mut engine = engine.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        engine.request(request)
+    })
+    .await
+    .map_err(|e| format!("engine worker failed: {e}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(Mutex::new(Engine::new()))
+        .manage::<SharedEngine>(Arc::new(Mutex::new(Engine::new())))
         .invoke_handler(tauri::generate_handler![engine_request, quit_app])
         .run(tauri::generate_context!())
         .expect("error while running Goof Troop Boop");

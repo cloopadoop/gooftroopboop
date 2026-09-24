@@ -105,6 +105,9 @@ CapcomCmdType DecodeCmdType(uint8_t statusByte) {
       return CapcomCmdType::EchoOnOff;
     case 0x1D:
       return CapcomCmdType::ReleaseRate;
+    case 0x1E:
+    case 0x1F:
+      return CapcomCmdType::NoOp;
     default:
       return CapcomCmdType::Unknown;
   }
@@ -189,6 +192,7 @@ bool DecodeCmd(RawFile *raw, uint32_t offset, CapcomCmdIR *out, std::string *err
     case CapcomCmdType::Tuning:
     case CapcomCmdType::PortamentoTime:
     case CapcomCmdType::ReleaseRate:
+    case CapcomCmdType::NoOp:
       if (truncated(2)) {
         return true;
       }
@@ -271,7 +275,8 @@ bool DecodeCmd(RawFile *raw, uint32_t offset, CapcomCmdIR *out, std::string *err
 bool CapcomTrackTraversal::Traverse(RawFile *raw,
                                     uint32_t trackStart,
                                     CapcomTrackTraversalResult *out,
-                                    std::string *error) {
+                                    std::string *error,
+                                    bool verifyControlFlow) {
   if (!raw || !out || !raw->isValidOffset(trackStart)) {
     if (error) {
       *error = "Invalid track start.";
@@ -296,9 +301,28 @@ bool CapcomTrackTraversal::Traverse(RawFile *raw,
   bool inRepeatLoop = false;
   uint32_t currentLoopSourceOffset = 0;
   std::unordered_set<uint32_t> visitedGotoTargets;
+  std::unordered_set<std::string> visitedStates;
 
   int parseCount = 0;
   while (raw->isValidOffset(curOffset) && parseCount++ < kMaxParseEvents) {
+    if (verifyControlFlow) {
+      // A jump address alone is not a cycle: repeat counters may make a
+      // conditional branch become active on a later visit. Import validation
+      // follows the driver until the complete branch-relevant state repeats.
+      std::string state = std::to_string(curOffset) + ":";
+      for (uint8_t count : repeatCount) {
+        state.push_back(static_cast<char>(count));
+      }
+      state.push_back(static_cast<char>(noteAttributes));
+      state.push_back(static_cast<char>(durationRate));
+      state.push_back(static_cast<char>(transpose));
+      state.push_back(static_cast<char>(globalTranspose));
+      state.push_back(static_cast<char>(program));
+      state.push_back(programChangeOffset != 0 ? 1 : 0);
+      if (!visitedStates.insert(state).second) {
+        return true;
+      }
+    }
     CapcomCmdIR cmd;
     if (!DecodeCmd(raw, curOffset, &cmd, error)) {
       return false;
@@ -396,7 +420,7 @@ bool CapcomTrackTraversal::Traverse(RawFile *raw,
         const uint8_t times = cmd.repeatCount;
         const uint32_t dest = cmd.destWord;
 
-        if (times == 0 && repeatCount[slot] == 0) {
+        if (!verifyControlFlow && times == 0 && repeatCount[slot] == 0) {
           return true;
         }
 
@@ -436,7 +460,7 @@ bool CapcomTrackTraversal::Traverse(RawFile *raw,
       }
       case CapcomCmdType::Goto: {
         const uint32_t dest = cmd.destWord;
-        if (!visitedGotoTargets.insert(dest).second) {
+        if (!verifyControlFlow && !visitedGotoTargets.insert(dest).second) {
           return true;
         }
         curOffset = dest;
@@ -452,6 +476,13 @@ bool CapcomTrackTraversal::Traverse(RawFile *raw,
 
   if (parseCount >= kMaxParseEvents) {
     L_WARN("CapcomTrackTraversal hit parse guardrail at 0x{:x}", curOffset);
+  }
+
+  if (verifyControlFlow) {
+    if (error) {
+      *error = "Control flow leaves available data or exceeds the validation event limit.";
+    }
+    return false;
   }
 
   return true;

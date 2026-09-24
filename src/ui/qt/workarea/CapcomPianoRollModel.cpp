@@ -341,6 +341,237 @@ uint32_t CapcomPianoRollModel::durationFromLength(uint32_t len, uint8_t duration
   return std::max<uint32_t>(1, dur);
 }
 
+std::vector<uint32_t> CapcomPianoRollModel::supportedNoteLengths(bool pendingDotted) {
+  std::set<uint32_t> lengths;
+  for (uint8_t index = 1; index <= 7; ++index) {
+    if (!pendingDotted) {
+      lengths.insert(lengthFromIndex(index, false, false));
+      lengths.insert(lengthFromIndex(index, false, true));
+    }
+    lengths.insert(lengthFromIndex(index, true, false));
+  }
+  return {lengths.begin(), lengths.end()};
+}
+
+bool CapcomPianoRollModel::buildTimedEvent(uint32_t ticks, uint8_t key, bool dotted, bool triplet,
+                                         std::vector<CapcomCmdIR> &commands) {
+  // Preserve the incoming mode where possible. Dotted is one-shot and cannot
+  // be cleared by NoteAttributes; triplet is persistent and must be restored.
+  for (int mode = 0; mode < 3; ++mode) {
+    const bool useDotted = dotted || mode == 2;
+    const bool useTriplet = mode == 1 ? !triplet : triplet;
+    for (uint8_t index = 1; index <= 7; ++index) {
+      if (lengthFromIndex(index, useDotted, useTriplet) != ticks) {
+        continue;
+      }
+      auto control = [&](CapcomCmdType type, uint8_t status) {
+        CapcomCmdIR cmd;
+        cmd.type = type;
+        cmd.statusByte = status;
+        cmd.sizeBytes = 1;
+        commands.push_back(cmd);
+      };
+      if (useTriplet != triplet) {
+        control(CapcomCmdType::ToggleTriplet, 0x00);
+      }
+      if (useDotted && !dotted) {
+        control(CapcomCmdType::DottedNoteOn, 0x02);
+      }
+      CapcomCmdIR cmd;
+      cmd.type = key == 0 ? CapcomCmdType::Rest : CapcomCmdType::Note;
+      cmd.keyIndex = key;
+      cmd.lenIndex = index;
+      cmd.statusByte = static_cast<uint8_t>((index << 5) | key);
+      cmd.sizeBytes = 1;
+      commands.push_back(cmd);
+      if (useTriplet != triplet) {
+        control(CapcomCmdType::ToggleTriplet, 0x00);
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+bool CapcomPianoRollModel::buildArticulatedNote(uint32_t ticks, uint8_t key, bool dotted, bool triplet,
+                                              bool slurred, uint8_t durationRate, uint8_t program,
+                                              const CapcomNoteEvent *sourceNote,
+                                              std::vector<CapcomCmdIR> &commands) {
+  if (!sourceNote || sourceNote->segments.size() <= 1) {
+    return buildTimedEvent(ticks, key, dotted, triplet, commands);
+  }
+  bool currentSlur = slurred;
+  uint8_t currentRate = durationRate, currentProgram = program;
+  uint32_t total = 0;
+  auto setSlur = [&](bool wanted) {
+    if (currentSlur == wanted) return;
+    CapcomCmdIR control;
+    control.type = CapcomCmdType::ToggleSlur;
+    control.statusByte = 0x01;
+    control.sizeBytes = 1;
+    commands.push_back(control);
+    currentSlur = wanted;
+  };
+  auto setValue = [&](CapcomCmdType type, uint8_t status, uint8_t wanted, uint8_t &current) {
+    if (current == wanted) return;
+    CapcomCmdIR control;
+    control.type = type;
+    control.statusByte = status;
+    control.sizeBytes = 2;
+    control.params = {wanted};
+    control.program = wanted;
+    commands.push_back(control);
+    current = wanted;
+  };
+  // Preserve constituent timing and articulation, not merely total duration.
+  for (const auto &segment : sourceNote->segments) {
+    setSlur(isSlurred(segment.noteAttributes));
+    setValue(CapcomCmdType::Duration, 0x06, segment.durationRate, currentRate);
+    setValue(CapcomCmdType::ProgramChange, 0x08, segment.program, currentProgram);
+    const uint32_t length = lengthFromIndex(segment.lenIndex, isDotted(segment.noteAttributes),
+                                            isTriplet(segment.noteAttributes));
+    if (!buildTimedEvent(length, key, total == 0 && dotted, triplet, commands)) return false;
+    total += length;
+  }
+  setSlur(slurred);
+  setValue(CapcomCmdType::Duration, 0x06, durationRate, currentRate);
+  setValue(CapcomCmdType::ProgramChange, 0x08, program, currentProgram);
+  return total == ticks;
+}
+
+bool CapcomPianoRollModel::buildRests(uint32_t ticks, bool dotted, bool triplet,
+                                    std::vector<CapcomCmdIR> &commands) {
+  if (ticks == 0) {
+    return !dotted;
+  }
+  // Bound work by the entire ARAM capacity. Tiny requested gaps must never
+  // round up: all integers >= 2 are composable from straight/triplet rests.
+  if (ticks > 192u * 0x10000u) {
+    return false;
+  }
+  while (ticks > 384) {
+    if (!buildTimedEvent(192, 0, dotted, triplet, commands)) {
+      return false;
+    }
+    dotted = false;
+    ticks -= 192;
+  }
+  const auto lengths = supportedNoteLengths();
+  std::vector<int> previous(ticks + 1, -1);
+  previous[0] = 0;
+  for (uint32_t total = 1; total <= ticks; ++total) {
+    for (auto length : lengths) {
+      if (length <= total && previous[total - length] >= 0) {
+        previous[total] = static_cast<int>(length);
+      }
+    }
+  }
+  // Only the first rest consumes an incoming dotted modifier.
+  for (auto it = lengths.rbegin(); it != lengths.rend(); ++it) {
+    const auto first = *it;
+    if (first > ticks || previous[ticks - first] < 0) {
+      continue;
+    }
+    if (!buildTimedEvent(first, 0, dotted, triplet, commands)) {
+      continue;
+    }
+    ticks -= first;
+    while (ticks > 0) {
+      const auto length = static_cast<uint32_t>(previous[ticks]);
+      if (!buildTimedEvent(length, 0, false, triplet, commands)) {
+        return false;
+      }
+      ticks -= length;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool CapcomPianoRollModel::replaceTimedEvent(int trackIndex, uint32_t offset,
+                                           const std::vector<CapcomCmdIR> &commands, std::string *error,
+                                           int replaceCount) {
+  const auto *data = trackData(trackIndex);
+  if (commands.empty() || !data || rejectBorrowed(trackIndex, offset, error) || !irTrack(trackIndex, error)) {
+    return false;
+  }
+  const int ti = m_ir->findTrackIndexByStartOffset(data->trackOffset);
+  const int ci = m_ir->findCmdIndexByOffset(ti, offset);
+  const auto *stream = m_ir->track(ti);
+  if (!stream || ci < 0 || replaceCount < 1 ||
+      static_cast<size_t>(ci) + static_cast<size_t>(replaceCount) > stream->cmds.size()) {
+    if (error) *error = "Cannot locate the complete timing range.";
+    m_ir.reset();
+    return false;
+  }
+  if (replaceCount > 1) {
+    std::unordered_set<uint32_t> interior;
+    for (int i = 0; i < replaceCount; ++i) {
+      const auto &event = stream->cmds[ci + i];
+      if (event.type != CapcomCmdType::Rest || event.origAbsOffset != offset + i) {
+        if (error) *error = "Rest range crosses a control or timing command.";
+        m_ir.reset();
+        return false;
+      }
+      if (i > 0) interior.insert(event.origAbsOffset);
+    }
+    // Interior entry points have independent timing semantics. Do not erase
+    // their delays, or redirect a jump to a different tick by deleting them.
+    for (int other = 0; other < CapcomSeqIR::MAX_TRACKS; ++other) {
+      const auto *candidate = m_ir->track(other);
+      if (!candidate) continue;
+      bool protectedRange = interior.count(candidate->origTrackStartAbs) != 0;
+      for (const auto &event : candidate->cmds) {
+        if (other != ti && interior.count(event.origAbsOffset)) protectedRange = true;
+        if ((event.type == CapcomCmdType::Goto || event.type == CapcomCmdType::RepeatUntil ||
+             event.type == CapcomCmdType::RepeatBreak) && interior.count(event.destWord)) {
+          protectedRange = true;
+        }
+      }
+      if (protectedRange) {
+        if (error) *error = "Rest range contains a shared or loop entry point; no edit was made.";
+        m_ir.reset();
+        return false;
+      }
+    }
+    for (int i = replaceCount - 1; i > 0; --i) {
+      if (!m_ir->removeCommand(ti, ci + i)) {
+        if (error) *error = "Cannot replace the complete rest range.";
+        m_ir.reset();
+        return false;
+      }
+    }
+  }
+  // Replacing the original command with the FIRST prefix preserves jump
+  // landings. Inserting a prefix before it would let loop entries skip it.
+  if (ci < 0 || !m_ir->updateCommand(ti, ci, commands.front())) {
+    if (error) {
+      *error = "Cannot replace timing event.";
+    }
+    m_ir.reset();
+    return false;
+  }
+  for (size_t i = 1; i < commands.size(); ++i) {
+    if (!m_ir->insertCommand(ti, ci + static_cast<int>(i), commands[i])) {
+      if (error) {
+        *error = "Cannot insert timing commands.";
+      }
+      m_ir.reset();
+      return false;
+    }
+  }
+  const auto before = captureRawSnapshot();
+  if (!m_ir->serializeToRaw(m_raw, error)) {
+    m_ir.reset();
+    return false;
+  }
+  SyncSeqTrackOffsetsFromHeader(m_seq, m_raw);
+  m_redo.clear();
+  pushRawDiffUndo(before);
+  reload();
+  return true;
+}
+
 uint8_t CapcomPianoRollModel::chooseLenIndex(uint32_t targetLen, bool dotted, bool triplet) {
   // lenIndex 0 would encode a note/rest status byte in the command range
   // (0x00-0x1F) and corrupt the stream, so the shortest representable note is
@@ -399,6 +630,26 @@ bool CapcomPianoRollModel::parseTrack(int trackIndex, uint32_t trackOffset, Capc
     }
   }
 
+  // The traversal follows the song-loop GOTO for one extra pass. Find that
+  // GOTO: the first one jumping back to bytes already played. (A GOTO into
+  // unplayed bytes is a channel borrowing another channel's melody.)
+  {
+    std::unordered_set<uint32_t> played;
+    for (const auto &step : traversal.steps) {
+      const auto &cmd = step.cmd;
+      if (cmd.type == CapcomCmdType::Goto && played.count(cmd.destWord) > 0) {
+        outTrack.hasSongLoop = true;
+        outTrack.songLoopTick = cmd.tick;
+        outTrack.songLoopGotoOffset = cmd.origAbsOffset;
+        if (const auto it = firstTickByOffset.find(cmd.destWord); it != firstTickByOffset.end()) {
+          outTrack.songLoopDestTick = it->second;
+        }
+        break;
+      }
+      played.insert(cmd.origAbsOffset);
+    }
+  }
+
   std::unordered_set<uint32_t> seenRepeatUntil;
 
   CapcomNoteEvent *lastNote = nullptr;
@@ -406,6 +657,7 @@ bool CapcomPianoRollModel::parseTrack(int trackIndex, uint32_t trackOffset, Capc
 
   for (const auto &step : traversal.steps) {
     const auto &cmd = step.cmd;
+    const bool replay = outTrack.hasSongLoop && cmd.tick >= outTrack.songLoopTick;
     switch (cmd.type) {
       case CapcomCmdType::Note:
       case CapcomCmdType::Rest: {
@@ -420,13 +672,15 @@ bool CapcomPianoRollModel::parseTrack(int trackIndex, uint32_t trackOffset, Capc
                                    cmd.transpose, cmd.globalTranspose);
         }
 
-        if (!isRest && slurred && lastNote && midiKey == lastKey) {
+        if (!isRest && slurred && lastNote && midiKey == lastKey && lastNote->isSongLoopReplay == replay) {
           lastNote->durationTicks += step.durationTicks;
           lastNote->deltaTicks += step.deltaTicks;
+          lastNote->segments.push_back(cmd);
           break;
         }
 
         CapcomNoteEvent ev;
+        ev.segments.push_back(cmd);
         ev.trackIndex = trackIndex;
         ev.rawOffset = cmd.origAbsOffset;
         ev.programChangeOffset = step.programChangeOffset;
@@ -447,8 +701,9 @@ bool CapcomPianoRollModel::parseTrack(int trackIndex, uint32_t trackOffset, Capc
         ev.globalTranspose = cmd.globalTranspose;
         ev.midiKey = midiKey;
         ev.isRest = isRest;
-        ev.isLoopRepeat = step.isLoopRepeat;
+        ev.isLoopRepeat = step.isLoopRepeat || replay;
         ev.loopSourceOffset = step.loopSourceOffset;
+        ev.isSongLoopReplay = replay;
         ev.instrumentName = instrumentNameForProgram(cmd.program);
         outTrack.notes.emplace_back(ev);
 
@@ -599,6 +854,34 @@ bool CapcomPianoRollModel::parseTrack(int trackIndex, uint32_t trackOffset, Capc
   return true;
 }
 
+int CapcomPianoRollModel::homeTrackOfOffset(uint32_t offset) const {
+  // Track data is laid out back to back, so an offset belongs to the track
+  // with the greatest start at or before it.
+  int home = -1;
+  uint32_t bestStart = 0;
+  for (size_t t = 0; t < m_tracks.size(); ++t) {
+    const uint32_t start = m_tracks[t].trackOffset;
+    if (start <= offset && (home < 0 || start > bestStart)) {
+      home = static_cast<int>(t);
+      bestStart = start;
+    }
+  }
+  return home;
+}
+
+bool CapcomPianoRollModel::rejectBorrowed(int trackIndex, uint32_t offset, std::string *error) const {
+  const int home = homeTrackOfOffset(offset);
+  if (home < 0 || trackIndex < 0 || static_cast<size_t>(trackIndex) >= m_tracks.size() ||
+      m_tracks[static_cast<size_t>(home)].trackOffset == m_tracks[static_cast<size_t>(trackIndex)].trackOffset) {
+    return false;
+  }
+  if (error) {
+    *error = "These notes are stored in Track " + std::to_string(home + 1) + " and this channel plays them "
+             "from there, so they can only be edited on Track " + std::to_string(home + 1) + ".";
+  }
+  return true;
+}
+
 std::string CapcomPianoRollModel::instrumentNameForProgram(uint8_t program) const {
   if (const auto it = goofTroopInstrumentNames().find(program); it != goofTroopInstrumentNames().end()) {
     return it->second;
@@ -633,7 +916,7 @@ bool CapcomPianoRollModel::applyEdit(int trackIndex,
   }
 
   const auto &note = data->notes[noteIndex];
-  const uint32_t desiredLen = std::max<uint32_t>(1, targetLenTicks);
+  const uint32_t desiredLen = targetLenTicks;
   const uint8_t newLenIndex = chooseLenIndex(desiredLen, note.dotted, note.triplet);
   const uint32_t newLen = lengthFromIndex(newLenIndex, note.dotted, note.triplet);
 
@@ -642,6 +925,48 @@ bool CapcomPianoRollModel::applyEdit(int trackIndex,
   int keyIndexCandidate = rawKey - octaveOffset + 1;
 
   uint8_t newKeyIndex = makeRest ? 0 : clampKeyIndex(keyIndexCandidate);
+  if (note.deltaTicks != lengthFromIndex(note.lenIndex, note.dotted, note.triplet)) {
+    if (desiredLen != note.deltaTicks) {
+      if (error) *error = "Use non-ripple resize to change a tied span's length.";
+      return false;
+    }
+    std::map<uint32_t, uint8_t> replacements;
+    for (const auto& segment : note.segments) {
+      const int key = midiKey - segment.transpose - segment.globalTranspose -
+          static_cast<int>(octave(segment.noteAttributes)) * 12 -
+          (isOctaveUp(segment.noteAttributes) ? 24 : 0) + 1;
+      if (!makeRest && (key < 1 || key > 31)) {
+        if (error) *error = "Pitch cannot be represented for every segment of the tied span.";
+        return false;
+      }
+      const uint8_t value = static_cast<uint8_t>((segment.statusByte & 0xE0) | (makeRest ? 0 : key));
+      const auto previous = replacements.find(segment.origAbsOffset);
+      if (previous != replacements.end() && previous->second != value) {
+        if (error) *error = "Shared tied segments require conflicting pitch values.";
+        return false;
+      }
+      replacements[segment.origAbsOffset] = value;
+    }
+    EditTransaction transaction(*this);
+    for (const auto& [offset, value] : replacements) {
+      if (!m_raw->writeByte(offset, value)) {
+        if (error) *error = "Failed to update tied span.";
+        return false;
+      }
+    }
+    reload();
+    return transaction.commit(error);
+  }
+  if (desiredLen != newLen) {
+    std::vector<CapcomCmdIR> commands;
+    if (!buildTimedEvent(desiredLen, newKeyIndex, note.dotted, note.triplet, commands)) {
+      if (error) {
+        *error = "Requested length is not representable in this timing context; no edit was made.";
+      }
+      return false;
+    }
+    return replaceTimedEvent(trackIndex, note.rawOffset, commands, error);
+  }
   const uint8_t newStatus = static_cast<uint8_t>((newLenIndex << 5) | (newKeyIndex & 0x1f));
 
   L_INFO("CapcomEdit track={}, note={}, offset=0x{:x}, old=0x{:02x}, new=0x{:02x}, midiKey={}, lenIdx={}, rest={}",
@@ -670,7 +995,8 @@ bool CapcomPianoRollModel::AppendNoteAtTick(int trackIndex,
                                             uint32_t tick,
                                             int midiKey,
                                             uint32_t lenTicks,
-                                            std::string *error) {
+                                            std::string *error,
+                                            const CapcomNoteEvent *sourceNote) {
   auto *data = trackData(trackIndex);
   if (!data) {
     if (error) *error = "Invalid track selection.";
@@ -678,15 +1004,6 @@ bool CapcomPianoRollModel::AppendNoteAtTick(int trackIndex,
   }
   if (!m_raw || !m_raw->isWritable()) {
     if (error) *error = "Backing file is not writable.";
-    return false;
-  }
-
-  uint32_t endTick = 0;
-  for (const auto &n : data->notes) {
-    endTick = std::max(endTick, n.startTick + n.deltaTicks);
-  }
-  if (tick < endTick) {
-    if (error) *error = "Position overlaps existing events.";
     return false;
   }
 
@@ -708,9 +1025,59 @@ bool CapcomPianoRollModel::AppendNoteAtTick(int trackIndex,
     return false;
   }
 
-  int insertIdx = static_cast<int>(trk->cmds.size());
-  if (insertIdx > 0 && trk->cmds.back().type == CapcomCmdType::End) {
-    --insertIdx;
+  // New material goes just before the track's terminal: its END (a finite
+  // track grows) or its song-loop GOTO (the looped body grows, so the note
+  // plays on every repeat). The looping GOTO comes from parseTrack's loop
+  // detection, not "the last command": some tracks end `goto ; end` (a dead
+  // END after the loop) and a GOTO into another channel's melody is not a loop.
+  uint32_t terminalOffset = 0;
+  if (data->hasSongLoop) {
+    terminalOffset = data->songLoopGotoOffset;
+    const int home = homeTrackOfOffset(terminalOffset);
+    if (home >= 0 && m_tracks[static_cast<size_t>(home)].trackOffset != data->trackOffset) {
+      if (error) {
+        *error = "This channel loops inside notes stored in Track " + std::to_string(home + 1) +
+                 ", so its loop can only be extended on Track " + std::to_string(home + 1) + ".";
+      }
+      return false;
+    }
+  } else if (!trk->cmds.empty() && trk->cmds.back().type == CapcomCmdType::End) {
+    terminalOffset = trk->cmds.back().origAbsOffset;
+  } else {
+    if (error) {
+      *error = "Cannot append after this track.";
+    }
+    return false;
+  }
+  const int insertIdx = m_ir->findCmdIndexByOffset(irTrackIndex, terminalOffset);
+  CapcomTrackTraversalResult traversal;
+  if (insertIdx < 0 || !CapcomTrackTraversal::Traverse(m_raw, data->trackOffset, &traversal, error)) {
+    if (error && error->empty()) {
+      *error = "Cannot find the end of this track.";
+    }
+    return false;
+  }
+  // Use the FIRST time the terminal is reached. A looping GOTO is walked again
+  // after the loop-back with a larger tick; the first pass ends at the body end.
+  const CapcomCmdIR *terminal = nullptr;
+  for (const auto &step : traversal.steps) {
+    if (step.cmd.origAbsOffset == terminalOffset) {
+      terminal = &step.cmd;
+      break;
+    }
+  }
+  if (!terminal || tick > std::numeric_limits<uint32_t>::max() - lenTicks) {
+    if (error) {
+      *error = "Cannot resolve a finite append timing context.";
+    }
+    return false;
+  }
+  const bool extendsLoop = data->hasSongLoop;
+  // The body end is where the terminal sits on the first pass.
+  const uint32_t endTick = terminal->tick;
+  if (tick < endTick) {
+    if (error) *error = "Position overlaps existing events.";
+    return false;
   }
 
   std::vector<CapcomCmdIR> newCmds;
@@ -725,7 +1092,7 @@ bool CapcomPianoRollModel::AppendNoteAtTick(int trackIndex,
   };
 
   const int clampedKey = std::clamp(midiKey, 0, 127);
-  const int transpose = data->notes.empty() ? 0 : data->notes.back().transpose + data->notes.back().globalTranspose;
+  const int transpose = terminal->transpose + terminal->globalTranspose;
   const int rawKey = clampedKey - transpose;
   const bool octaveUp = rawKey >= 96;
   const int octaveBase = octaveUp ? 24 : 0;
@@ -739,20 +1106,32 @@ bool CapcomPianoRollModel::AppendNoteAtTick(int trackIndex,
   }
   const uint8_t keyIndex = static_cast<uint8_t>(keyCandidate);
 
-  // A fresh track needs its basic voice state before the first note.
+  // A fresh track needs its basic voice state before the first note - but only
+  // the parts it doesn't already have. A track can carry setup commands
+  // (volume/duration/program from the new-song template or a prior edit) with
+  // no notes yet; blindly re-emitting a ProgramChange here used to clobber the
+  // track's real instrument back to Electric Piano.
   if (data->notes.empty()) {
-    pushSetting(CapcomCmdType::Volume, 0x07, 0xC0);
-    pushSetting(CapcomCmdType::Duration, 0x06, 0xC0);
-    pushSetting(CapcomCmdType::ProgramChange, 0x08, 0x08);
+    bool hasVol = false, hasDur = false, hasProg = false;
+    for (int i = 0; i < insertIdx && i < static_cast<int>(trk->cmds.size()); ++i) {
+      switch (trk->cmds[static_cast<size_t>(i)].type) {
+        case CapcomCmdType::Volume: hasVol = true; break;
+        case CapcomCmdType::Duration: hasDur = true; break;
+        case CapcomCmdType::ProgramChange: hasProg = true; break;
+        default: break;
+      }
+    }
+    if (!hasVol) pushSetting(CapcomCmdType::Volume, 0x07, 0xC0);
+    if (!hasDur) pushSetting(CapcomCmdType::Duration, 0x06, 0xC0);
+    if (!hasProg) pushSetting(CapcomCmdType::ProgramChange, 0x08, 0x08);
     pushSetting(CapcomCmdType::Octave, 0x09, oct);
   } else {
     // only emit an octave change when the track isn't already there
-    const auto &last = data->notes.back();
-    if (last.octave != oct) {
+    if (octave(terminal->noteAttributes) != oct) {
       pushSetting(CapcomCmdType::Octave, 0x09, oct);
     }
   }
-  const bool previousOctaveUp = !data->notes.empty() && data->notes.back().octaveUp;
+  const bool previousOctaveUp = isOctaveUp(terminal->noteAttributes);
   if (previousOctaveUp != octaveUp) {
     CapcomCmdIR toggle;
     toggle.type = CapcomCmdType::ToggleOctaveUp;
@@ -762,42 +1141,115 @@ bool CapcomPianoRollModel::AppendNoteAtTick(int trackIndex,
     newCmds.push_back(toggle);
   }
 
-  // Fill the silent gap with rests, longest encodable first
-  // (lenIndex 1..7 -> 3,6,12,24,48,96,192 ticks).
-  uint32_t gap = tick - endTick;
-  for (int li = 7; li >= 1 && gap > 0; --li) {
-    const uint32_t len = lengthFromIndex(static_cast<uint8_t>(li), false, false);
-    while (gap >= len) {
-      CapcomCmdIR r;
-      r.type = CapcomCmdType::Rest;
-      r.statusByte = static_cast<uint8_t>(li << 5);
-      r.lenIndex = static_cast<uint8_t>(li);
-      r.sizeBytes = 1;
-      r.origAbsOffset = 0xFFFFFFFF;
-      newCmds.push_back(r);
-      gap -= len;
+  const uint32_t gap = tick - endTick;
+  const bool dotted = isDotted(terminal->noteAttributes);
+  const bool triplet = isTriplet(terminal->noteAttributes);
+  if (gap > 0 && !buildRests(gap, dotted, triplet, newCmds)) {
+    if (error) {
+      *error = "Gap is not representable in this timing context (minimum rest is 2 ticks).";
+    }
+    return false;
+  }
+  uint8_t durationRate = terminal->durationRate;
+  uint8_t program = terminal->program;
+  for (const auto &command : newCmds) {
+    if (command.params.empty()) continue;
+    if (command.type == CapcomCmdType::Duration) durationRate = command.params[0];
+    if (command.type == CapcomCmdType::ProgramChange) program = command.params[0];
+  }
+  if (!buildArticulatedNote(lenTicks, keyIndex, gap == 0 && dotted, triplet,
+                            isSlurred(terminal->noteAttributes), durationRate, program, sourceNote, newCmds)) {
+    if (error) {
+      *error = "Requested length is not representable in this timing context; no edit was made.";
+    }
+    return false;
+  }
+  // Inside a loop the GOTO carries the state around to the loop start, so put
+  // back what the loop body expects there: without this every later pass would
+  // play in the new note's octave.
+  if (extendsLoop) {
+    const uint8_t loopOctave = octave(terminal->noteAttributes);
+    if (oct != loopOctave) {
+      pushSetting(CapcomCmdType::Octave, 0x09, loopOctave);
+    }
+    if (previousOctaveUp != octaveUp) {
+      CapcomCmdIR toggleBack;
+      toggleBack.type = CapcomCmdType::ToggleOctaveUp;
+      toggleBack.statusByte = 0x03;
+      toggleBack.sizeBytes = 1;
+      toggleBack.origAbsOffset = 0xFFFFFFFF;
+      newCmds.push_back(toggleBack);
     }
   }
-  if (gap != 0) {
-    if (error) *error = "Position is not representable (finest rest is 3 ticks).";
+
+  // Insert `cmds` before command `at` of IR track `irTrack`, then point any
+  // jump that targeted that command (a repeat's exit landing on the END/GOTO)
+  // at the first inserted command, so the new material is played on that path
+  // too instead of being skipped.
+  auto insertBeforeTerminal = [&](int irTrack, int at, const std::vector<CapcomCmdIR> &cmds) {
+    for (size_t i = 0; i < cmds.size(); ++i) {
+      if (!m_ir->insertCommand(irTrack, at + static_cast<int>(i), cmds[i])) {
+        return false;
+      }
+    }
+    const int movedTerminal = at + static_cast<int>(cmds.size());
+    for (int t = 0; t < 8; ++t) {
+      auto *other = m_ir->track(t);
+      if (!other) {
+        continue;
+      }
+      for (auto &c : other->cmds) {
+        if (c.destTrackIndex == irTrack && c.destCmdIndex == movedTerminal) {
+          c.destCmdIndex = at;
+        }
+      }
+    }
+    return true;
+  };
+
+  if (!insertBeforeTerminal(irTrackIndex, insertIdx, newCmds)) {
+    if (error) *error = "Failed to insert note commands.";
+    m_ir.reset();  // IR may hold a partial insert; drop it and re-parse next edit
     return false;
   }
 
-  const uint8_t lenIdx = chooseLenIndex(lenTicks, false, false);
-  CapcomCmdIR nc;
-  nc.type = CapcomCmdType::Note;
-  nc.statusByte = static_cast<uint8_t>((lenIdx << 5) | keyIndex);
-  nc.keyIndex = keyIndex;
-  nc.lenIndex = lenIdx;
-  nc.sizeBytes = 1;
-  nc.origAbsOffset = 0xFFFFFFFF;
-  newCmds.push_back(nc);
-
-  for (size_t i = 0; i < newCmds.size(); ++i) {
-    if (!m_ir->insertCommand(irTrackIndex, insertIdx + static_cast<int>(i), newCmds[i])) {
-      if (error) *error = "Failed to insert note commands.";
-      m_ir.reset();  // IR may hold a partial insert; drop it and re-parse next edit
-      return false;
+  // Extending one channel's loop body alone would make its cycle longer than
+  // the others', so the channels drift apart on every repeat. Pad every other
+  // channel that loops at the same point with rests by the same amount.
+  if (extendsLoop) {
+    const uint32_t pad = tick + lenTicks - endTick;
+    for (size_t t2 = 0; t2 < m_tracks.size(); ++t2) {
+      const auto &d2 = m_tracks[t2];
+      if (static_cast<int>(t2) == trackIndex || !d2.hasSongLoop || d2.songLoopTick != endTick) {
+        continue;
+      }
+      const int ir2 = m_ir->findTrackIndexByStartOffset(d2.trackOffset);
+      const int home2 = homeTrackOfOffset(d2.songLoopGotoOffset);
+      if (ir2 < 0 || ir2 == irTrackIndex || home2 < 0 ||
+          m_tracks[static_cast<size_t>(home2)].trackOffset != d2.trackOffset) {
+        continue;  // same stream, or a loop living in another channel's bytes (padded there)
+      }
+      const int idx2 = m_ir->findCmdIndexByOffset(ir2, d2.songLoopGotoOffset);
+      CapcomTrackTraversalResult tr2;
+      const CapcomCmdIR *term2 = nullptr;
+      if (idx2 >= 0 && CapcomTrackTraversal::Traverse(m_raw, d2.trackOffset, &tr2)) {
+        for (const auto &step : tr2.steps) {
+          if (step.cmd.origAbsOffset == d2.songLoopGotoOffset) {
+            term2 = &step.cmd;
+            break;
+          }
+        }
+      }
+      std::vector<CapcomCmdIR> rests;
+      if (!term2 || !buildRests(pad, isDotted(term2->noteAttributes), isTriplet(term2->noteAttributes), rests) ||
+          !insertBeforeTerminal(ir2, idx2, rests)) {
+        if (error) {
+          *error = "Could not extend Track " + std::to_string(t2 + 1) +
+                   "'s loop by the same amount, so the channels would drift apart; no edit was made.";
+        }
+        m_ir.reset();
+        return false;
+      }
     }
   }
 
@@ -821,7 +1273,8 @@ bool CapcomPianoRollModel::InsertNoteAtTick(int track_index,
                                             uint32_t target_len_ticks,
                                             uint32_t *out_tick,
                                             uint32_t *out_duration_diff,
-                                            std::string *error) {
+                                            std::string *error,
+                                            const CapcomNoteEvent *sourceNote) {
   if (out_tick) {
     *out_tick = 0;
   }
@@ -846,6 +1299,12 @@ bool CapcomPianoRollModel::InsertNoteAtTick(int track_index,
   int note_index = -1;
   for (size_t i = 0; i < data->notes.size(); ++i) {
     const auto &note = data->notes[i];
+    // A replay after the song loop shares bytes with a first-pass event;
+    // editing it would put the note at the first-pass tick. Past the loop point
+    // is "no event here", which routes callers to AppendNoteAtTick.
+    if (note.isSongLoopReplay) {
+      continue;
+    }
     const uint32_t end_tick = note.startTick + note.deltaTicks;
     if (tick >= note.startTick && tick < end_tick) {
       note_index = static_cast<int>(i);
@@ -861,6 +1320,9 @@ bool CapcomPianoRollModel::InsertNoteAtTick(int track_index,
   }
 
   const auto &note = data->notes[static_cast<size_t>(note_index)];
+  if (rejectBorrowed(track_index, note.rawOffset, error)) {
+    return false;
+  }
   const uint32_t base_len = lengthFromIndex(note.lenIndex, note.dotted, note.triplet);
   if (note.deltaTicks != base_len) {
     if (error) {
@@ -869,7 +1331,72 @@ bool CapcomPianoRollModel::InsertNoteAtTick(int track_index,
     return false;
   }
 
+  if (note.isRest) {
+    const uint32_t leading = tick - note.startTick;
+    uint32_t available = base_len;
+    int replaceCount = 1;
+    // Consume only as much consecutive silent space as needed. Source-byte
+    // adjacency excludes intervening program, articulation and loop commands.
+    while (target_len_ticks > available - leading &&
+           static_cast<size_t>(note_index + replaceCount) < data->notes.size()) {
+      const auto &next = data->notes[static_cast<size_t>(note_index + replaceCount)];
+      if (!next.isRest || next.isSongLoopReplay || next.rawOffset != note.rawOffset + replaceCount ||
+          next.startTick != note.startTick + available ||
+          next.deltaTicks != lengthFromIndex(next.lenIndex, next.dotted, next.triplet)) break;
+      available += next.deltaTicks;
+      ++replaceCount;
+    }
+    // A finite track may grow at its end. There are no downstream events to
+    // displace when this rest range is followed immediately by END.
+    const uint32_t afterRange = note.rawOffset + replaceCount;
+    if (target_len_ticks > available - leading &&
+        static_cast<size_t>(note_index + replaceCount) == data->notes.size() &&
+        m_raw->isValidOffset(afterRange) && m_raw->readByte(afterRange) == 0x17 &&
+        target_len_ticks <= std::numeric_limits<uint32_t>::max() - leading) {
+      available = leading + target_len_ticks;
+    }
+    if (target_len_ticks == 0 || target_len_ticks > available - leading) {
+      if (error) {
+        *error = "Requested length exceeds the available rest; no edit was made.";
+      }
+      return false;
+    }
+    const int rawKey = midi_key - note.transpose - note.globalTranspose;
+    const int key = rawKey - static_cast<int>(note.octave) * 12 - (note.octaveUp ? 24 : 0) + 1;
+    if (key < 1 || key > 31) {
+      if (error) {
+        *error = "Pitch cannot be represented with the current octave/transpose.";
+      }
+      return false;
+    }
+    std::vector<CapcomCmdIR> commands;
+    const uint32_t trailing = available - leading - target_len_ticks;
+    bool generated = leading == 0 || buildRests(leading, note.dotted, note.triplet, commands);
+    if (generated) {
+      generated = buildArticulatedNote(target_len_ticks, static_cast<uint8_t>(key),
+                                      leading == 0 && note.dotted, note.triplet, note.slurred,
+                                      note.durationRate, note.program, sourceNote, commands);
+    }
+    if (!generated || (trailing > 0 && !buildRests(trailing, false, note.triplet, commands))) {
+      if (error) {
+        *error = "Position or length is not representable in this timing context; no edit was made.";
+      }
+      return false;
+    }
+    if (!replaceTimedEvent(track_index, note.rawOffset, commands, error, replaceCount)) {
+      return false;
+    }
+    if (out_tick) {
+      *out_tick = tick;
+    }
+    return true;
+  }
+
   if (!note.isRest) {
+    if (sourceNote && sourceNote->segments.size() > 1) {
+      if (error) *error = "A tied span needs rest space to preserve its articulation.";
+      return false;
+    }
     if (tick == note.startTick) {
       if (error) {
         *error = "Cannot insert at the start of a note.";
@@ -926,7 +1453,7 @@ bool CapcomPianoRollModel::InsertNoteAtTick(int track_index,
     return false;
   }
 
-  const uint32_t desired_len = std::max<uint32_t>(1, target_len_ticks);
+  const uint32_t desired_len = target_len_ticks;
   const int target_midi = std::clamp(midi_key, 0, 127);
   const int raw_key = target_midi - note.transpose - note.globalTranspose;
   const int octave_offset = static_cast<int>(note.octave) * 12 + (note.octaveUp ? 24 : 0);
@@ -1159,9 +1686,9 @@ bool CapcomPianoRollModel::InsertNoteAtTick(int track_index,
     }
   }
 
-  if (!found) {
+  if (!found || best_pre_diff != 0 || best_len_diff != 0) {
     if (error) {
-      *error = "Cannot split this note length; try another position or length.";
+      *error = "Position or length is not exactly representable in this note's silent tail.";
     }
     return false;
   }
@@ -1211,6 +1738,12 @@ bool CapcomPianoRollModel::InsertNoteAtTick(int track_index,
     }
     pre_rate = best_rate;
     duration_diff = best_diff;
+    if (duration_diff != 0) {
+      if (error) {
+        *error = "Cannot preserve the original sounding duration at this position.";
+      }
+      return false;
+    }
     if (out_duration_diff) {
       *out_duration_diff = duration_diff;
     }
@@ -1423,6 +1956,12 @@ bool CapcomPianoRollModel::MoveNote(int trackIndex,
     }
     return false;
   }
+  if (note.isSongLoopReplay) {
+    if (error) {
+      *error = "That note is the loop replaying; edit it in the first pass of the song.";
+    }
+    return false;
+  }
 
   const uint32_t clampedTick = tick;
   const int clampedMidi = std::clamp(midiKey, 0, 127);
@@ -1441,7 +1980,7 @@ bool CapcomPianoRollModel::MoveNote(int trackIndex,
       continue;
     }
     const auto &other = data->notes[i];
-    if (other.midiKey < 0 || other.isRest) {
+    if (other.midiKey < 0 || other.isRest || other.isSongLoopReplay) {
       continue;
     }
     const uint32_t otherStart = other.startTick;
@@ -1468,13 +2007,19 @@ bool CapcomPianoRollModel::MoveNote(int trackIndex,
 
   uint32_t insertedTick = 0;
   uint32_t durationDiff = 0;
-  if (!InsertNoteAtTick(trackIndex,
+  bool inserted = InsertNoteAtTick(trackIndex,
                         clampedTick,
                         clampedMidi,
                         note.deltaTicks,
                         &insertedTick,
                         &durationDiff,
-                        &tmpError)) {
+                        &tmpError, &note);
+  if (!inserted && tmpError.find("No event at this position") != std::string::npos) {
+    tmpError.clear();
+    inserted = AppendNoteAtTick(trackIndex, clampedTick, clampedMidi, note.deltaTicks, &tmpError, &note);
+    if (inserted) insertedTick = clampedTick;
+  }
+  if (!inserted) {
     std::string undoError;
     undo(&undoError);
     m_redo.clear();
@@ -1543,6 +2088,22 @@ bool CapcomPianoRollModel::eraseNotes(const std::vector<std::pair<int, int>> &no
     return false;
   }
 
+  // Resize/move also erase first. Validate the ENTIRE selection before any
+  // write: a displayed tied span owns multiple event bytes, and erasing only
+  // its first one would leave audible continuations behind.
+  // Erasing edits bytes in place, so on shared melody bytes it works and every
+  // channel that plays them hears it (see test_shared_song_edit); only
+  // structural IR edits need rejectBorrowed.
+  for (const auto &[trackIndex, noteIndex] : noteRefs) {
+    const auto *data = trackData(trackIndex);
+    if (!data || noteIndex < 0 || noteIndex >= static_cast<int>(data->notes.size())) {
+      if (error) {
+        *error = "Invalid note selection.";
+      }
+      return false;
+    }
+  }
+
   std::unordered_set<uint32_t> seenOffsets;
   std::vector<EditEntry> batch;
   for (const auto &[trackIndex, noteIndex] : noteRefs) {
@@ -1554,24 +2115,16 @@ bool CapcomPianoRollModel::eraseNotes(const std::vector<std::pair<int, int>> &no
       return false;
     }
     const auto &note = data->notes[static_cast<size_t>(noteIndex)];
-    if (!seenOffsets.insert(note.rawOffset).second) {
-      continue;  // skip duplicates
-    }
-    const uint8_t newStatus = static_cast<uint8_t>((note.lenIndex << 5) | 0);
-    L_INFO("CapcomEdit track={}, note={}, offset=0x{:x}, old=0x{:02x}, new=0x{:02x}, midiKey={}, lenIdx={}, rest=true",
-           trackIndex, noteIndex, note.rawOffset, note.statusByte, newStatus, note.midiKey, note.lenIndex);
-    if (!m_raw->writeByte(note.rawOffset, newStatus)) {
-      if (error) {
-        *error = "Failed to write to raw file buffer.";
+    for (const auto& segment : note.segments) {
+      if (!seenOffsets.insert(segment.origAbsOffset).second) continue;
+      const uint8_t newStatus = static_cast<uint8_t>(segment.statusByte & 0xE0);
+      if (!m_raw->writeByte(segment.origAbsOffset, newStatus)) {
+        if (error) *error = "Failed to write to raw file buffer.";
+        return false;
       }
-      return false;
+      batch.push_back(EditEntry{m_raw, segment.origAbsOffset, segment.statusByte, newStatus});
+      recordEdit(m_raw, segment.origAbsOffset);
     }
-    const auto verify = m_raw->readByte(note.rawOffset);
-    if (verify != newStatus) {
-      L_WARN("CapcomEdit verification mismatch at 0x{:x}: wrote 0x{:02x}, read back 0x{:02x}", note.rawOffset, newStatus, verify);
-    }
-    batch.push_back(EditEntry{m_raw, note.rawOffset, note.statusByte, newStatus});
-    recordEdit(m_raw, note.rawOffset);
   }
 
   if (!batch.empty()) {
@@ -1636,6 +2189,9 @@ bool CapcomPianoRollModel::setInstrument(const std::vector<std::pair<int, int>> 
     const auto &note = data->notes[static_cast<size_t>(noteIndex)];
     L_INFO("setInstrument: note track={} idx={} offset=0x{:x} currentProg=0x{:02x}", 
            trackIndex, noteIndex, note.rawOffset, note.program);
+    if (rejectBorrowed(trackIndex, note.rawOffset, error)) {
+      return false;
+    }
     if (note.program != program) {
       anyChange = true;
     }
@@ -1722,12 +2278,26 @@ bool CapcomPianoRollModel::setInstrument(const std::vector<std::pair<int, int>> 
               return a.programValue < b.programValue;
             });
 
-  insertions.erase(std::unique(insertions.begin(), insertions.end(),
-                               [](const InsertOp &a, const InsertOp &b) {
-                                 return a.trackIndex == b.trackIndex && a.beforeCmdIndex == b.beforeCmdIndex &&
-                                        a.programValue == b.programValue;
-                               }),
-                   insertions.end());
+  // One program change per insertion point. Two can collide when a repeat
+  // body replays: the "restore" queued for the note after the selection can be
+  // the same bytes as a selected note, so both land before the same command.
+  // The selected note's new program must win; keeping both let the sort order
+  // (by program value) decide, and the old instrument survived whenever the new
+  // program number was higher.
+  {
+    std::vector<InsertOp> kept;
+    for (const auto &op : insertions) {
+      auto same = std::find_if(kept.begin(), kept.end(), [&](const InsertOp &k) {
+        return k.trackIndex == op.trackIndex && k.beforeCmdIndex == op.beforeCmdIndex;
+      });
+      if (same == kept.end()) {
+        kept.push_back(op);
+      } else if (op.programValue == program) {
+        *same = op;
+      }
+    }
+    insertions.swap(kept);
+  }
 
   std::vector<uint8_t> before;
   before.reserve(m_raw->size());
@@ -1742,7 +2312,20 @@ bool CapcomPianoRollModel::setInstrument(const std::vector<std::pair<int, int>> 
       if (error) {
         *error = "Failed to insert program change in IR.";
       }
+      m_ir.reset();  // may hold earlier inserts; re-parse from the untouched raw next edit
       return false;
+    }
+  }
+
+  // Self-clean: each edit leaves the previous edit's "restore" ProgramChange
+  // sitting right in front of the one just inserted (PC old, PC new, note),
+  // so repeated instrument changes grew the track by 2 dead bytes each time.
+  {
+    std::set<int> touched;
+    for (const auto &ins : insertions) touched.insert(ins.trackIndex);
+    const int dropped = dropDeadProgramChanges(touched);
+    if (dropped > 0) {
+      L_INFO("setInstrument: dropped {} dead ProgramChange command(s)", dropped);
     }
   }
 
@@ -2476,6 +3059,212 @@ bool CapcomPianoRollModel::removeLoop(int trackIndex, size_t loopIndex, std::str
   return true;
 }
 
+bool CapcomPianoRollModel::endSongLoops(std::string *error) {
+  if (!m_raw || !m_raw->isWritable()) {
+    if (error) *error = "Backing file is not writable.";
+    return false;
+  }
+  if (!m_ir) {
+    m_ir = std::make_unique<CapcomSeqIR>();
+    m_ir->setMinAllocation(m_allocationFloor);
+    if (!m_ir->parseFromSeq(m_seq, m_raw)) {
+      if (error) *error = "Failed to parse sequence IR.";
+      return false;
+    }
+  }
+  bool changed = false;
+  std::set<uint32_t> converted;  // a GOTO shared by several channels is converted once
+  for (const auto &d : m_tracks) {
+    if (!d.hasSongLoop || converted.count(d.songLoopGotoOffset) > 0) {
+      continue;
+    }
+    // The loop GOTO found by parseTrack (not "the last command": tracks can end
+    // `goto ; end`, and a GOTO into another channel's melody is not a loop).
+    // Convert it where it lives: its home track's stream.
+    const int home = homeTrackOfOffset(d.songLoopGotoOffset);
+    if (home < 0) {
+      continue;
+    }
+    const int ti = m_ir->findTrackIndexByStartOffset(m_tracks[static_cast<size_t>(home)].trackOffset);
+    const int loopIdx = ti < 0 ? -1 : m_ir->findCmdIndexByOffset(ti, d.songLoopGotoOffset);
+    if (loopIdx < 0) {
+      continue;  // verified below: a loop we could not reach makes the whole edit fail
+    }
+    converted.insert(d.songLoopGotoOffset);
+    // Swap only the GOTO for an END. Anything after it stays: other channels
+    // may play melodies stored there. Jumps that landed on the GOTO (a repeat's
+    // exit) must land on the END; remove+insert at one index leaves every
+    // other index unchanged, so remember them and repoint afterwards.
+    std::vector<std::pair<int, int>> landers;
+    for (int t = 0; t < 8; ++t) {
+      const auto *other = m_ir->track(t);
+      if (!other) {
+        continue;
+      }
+      for (int i = 0; i < static_cast<int>(other->cmds.size()); ++i) {
+        const auto &c = other->cmds[static_cast<size_t>(i)];
+        if (c.destTrackIndex == ti && c.destCmdIndex == loopIdx && !(t == ti && i == loopIdx)) {
+          landers.emplace_back(t, i);
+        }
+      }
+    }
+    CapcomCmdIR end;
+    end.type = CapcomCmdType::End;
+    end.statusByte = 0x17;
+    end.sizeBytes = 1;
+    end.origAbsOffset = 0xFFFFFFFF;
+    if (!m_ir->removeCommand(ti, loopIdx) || !m_ir->insertCommand(ti, loopIdx, end)) {
+      if (error) *error = "Failed to end the song loop.";
+      m_ir.reset();
+      return false;
+    }
+    for (const auto &[t, i] : landers) {
+      m_ir->track(t)->cmds[static_cast<size_t>(i)].destCmdIndex = loopIdx;
+    }
+    changed = true;
+  }
+  if (!changed) return true;  // nothing looped
+
+  const auto undoSnap = captureRawSnapshot();
+  if (!m_ir->serializeToRaw(m_raw, error)) {
+    m_ir.reset();
+    return false;
+  }
+  if (!SyncSeqTrackOffsetsFromHeader(m_seq, m_raw)) {
+    L_WARN("endSongLoops: failed to sync track offsets from header");
+  }
+
+  // Verify with the same definition parseTrack uses: after re-parsing, no
+  // channel may still jump back into bytes it already played. (GOTOs into
+  // another channel's melody are not loops and correctly survive.) If any loop
+  // remains - e.g. one we could not reach - roll back completely rather than
+  // ship a half-ended song.
+  const bool parsed = reload();
+  bool stillLoops = !parsed;
+  for (const auto &d : m_tracks) {
+    if (d.hasSongLoop) {
+      stillLoops = true;
+    }
+  }
+  if (stillLoops) {
+    // restore the pre-edit bytes and report; nothing is committed
+    m_raw->writeBytes(0, undoSnap);
+    SyncSeqTrackOffsetsFromHeader(m_seq, m_raw);
+    reload();
+    if (error) {
+      *error = "This song's loop could not be ended on every channel, so nothing was changed.";
+    }
+    return false;
+  }
+
+  m_redo.clear();
+  pushRawDiffUndo(undoSnap);
+  return true;
+}
+
+int CapcomPianoRollModel::dropDeadProgramChanges(const std::set<int> &trackIndices) {
+  if (!m_ir) return 0;
+
+  // Same landing-point discipline as optimizeSequence: a command a jump
+  // lands on is never removed, whether the jump comes from this track
+  // (index-based) or another one (matched by home offset).
+  std::set<std::pair<int, int>> jumpTargets;
+  std::set<uint32_t> jumpTargetOffsets;
+  for (int ti = 0; ti < 8; ++ti) {
+    const auto *trk = m_ir->track(ti);
+    if (!trk) continue;
+    for (const auto &c : trk->cmds) {
+      if (c.destCmdIndex < 0) continue;
+      jumpTargets.insert({c.destTrackIndex, c.destCmdIndex});
+      const auto *dtrk = m_ir->track(c.destTrackIndex);
+      if (dtrk && c.destCmdIndex < static_cast<int>(dtrk->cmds.size())) {
+        const uint32_t off = dtrk->cmds[static_cast<size_t>(c.destCmdIndex)].origAbsOffset;
+        if (off != 0xFFFFFFFFu) jumpTargetOffsets.insert(off);
+      }
+    }
+  }
+  auto isProtected = [&](int ti, int idx, const CapcomCmdIR &c) {
+    if (jumpTargets.count({ti, idx})) return true;
+    return c.origAbsOffset != 0xFFFFFFFFu && jumpTargetOffsets.count(c.origAbsOffset) > 0;
+  };
+  // Zero-duration state setters that may sit between the two program
+  // changes without letting the dead value reach a voice.
+  auto isTransparent = [](CapcomCmdType t) {
+    switch (t) {
+      case CapcomCmdType::Octave:
+      case CapcomCmdType::Volume:
+      case CapcomCmdType::Duration:
+      case CapcomCmdType::Pan:
+      case CapcomCmdType::Transpose:
+      case CapcomCmdType::Tuning:
+        return true;
+      default:
+        return false;
+    }
+  };
+
+  // Whether the control flow leaves this command linearly (what follows is
+  // reached only via a landing, if at all).
+  auto isFlowBreak = [](CapcomCmdType t) {
+    return t == CapcomCmdType::Goto || t == CapcomCmdType::RepeatUntil ||
+           t == CapcomCmdType::RepeatBreak || t == CapcomCmdType::End;
+  };
+
+  int dropped = 0;
+  for (int ti : trackIndices) {
+    auto *trk = m_ir->track(ti);
+    if (!trk) continue;
+    // Program the voice is known to hold at this point in the stream, or -1
+    // when it could have arrived from anywhere (track start, a landing, a
+    // command we don't model).
+    int known = -1;
+    for (int i = 0; i < static_cast<int>(trk->cmds.size());) {
+      const auto &cur = trk->cmds[static_cast<size_t>(i)];
+      const bool landing = isProtected(ti, i, cur);
+      if (landing) known = -1;
+      if (cur.type != CapcomCmdType::ProgramChange) {
+        if (isFlowBreak(cur.type) || cur.type == CapcomCmdType::Unknown) known = -1;
+        ++i;
+        continue;
+      }
+      // parseFromSeq leaves cmd.program unset; the operand byte is the truth
+      const int value = cur.params.empty() ? cur.program : cur.params[0];
+      bool redundant = false;
+      if (!landing) {
+        if (known == value) {
+          // Same-value re-set: corpus render tests put this in the same class
+          // as a dead store (~-25 dB spectral distance, i.e. the driver's
+          // sub-sample timing jitter) versus +74 dB for a real change.
+          redundant = true;
+        } else {
+          // Dead store: overwritten before anything timed (note/rest) runs,
+          // so the value never reaches a voice. (cmd.tick is only populated
+          // for inserted commands, so time is judged by command type.)
+          for (size_t j = static_cast<size_t>(i) + 1; j < trk->cmds.size(); ++j) {
+            const auto &nxt = trk->cmds[j];
+            if (nxt.type == CapcomCmdType::ProgramChange) { redundant = true; break; }
+            if (!isTransparent(nxt.type)) break;
+          }
+        }
+      }
+      if (!redundant || !m_ir->removeCommand(ti, i)) {
+        known = value;
+        ++i;
+        continue;
+      }
+      ++dropped;
+      std::set<std::pair<int, int>> remapped;
+      for (const auto &t : jumpTargets) {
+        if (t.first == ti && t.second > i) remapped.insert({t.first, t.second - 1});
+        else remapped.insert(t);
+      }
+      jumpTargets.swap(remapped);
+      // do not advance: the next command slid into index i
+    }
+  }
+  return dropped;
+}
+
 bool CapcomPianoRollModel::optimizeSequence(uint32_t *bytesBefore,
                                              uint32_t *bytesAfter,
                                              std::string *error) {
@@ -2682,6 +3471,74 @@ bool CapcomPianoRollModel::optimizeSequence(uint32_t *bytesBefore,
   uint32_t after = 0;
   byteUsage(&after, &budget);
   if (bytesAfter) *bytesAfter = after;
+  return true;
+}
+
+CapcomPianoRollModel::EditTransaction::EditTransaction(CapcomPianoRollModel &model)
+    : m_model(model), m_raw(model.m_raw), m_before(model.captureRawSnapshot()),
+      m_undo(model.m_undo), m_redo(model.m_redo), m_recentEdits(s_recentEdits),
+      m_allocationFloor(model.m_allocationFloor) {
+}
+
+CapcomPianoRollModel::EditTransaction::~EditTransaction() {
+  if (m_active) {
+    std::string error;
+    if (!rollback(&error)) {
+      L_ERROR("Edit transaction rollback failed: {}", error);
+    }
+  }
+}
+
+bool CapcomPianoRollModel::EditTransaction::commit(std::string *error) {
+  if (!m_active || !m_raw || m_model.m_raw != m_raw || m_raw->size() != m_before.size()) {
+    if (error) {
+      *error = "Cannot commit transaction: backing data changed.";
+    }
+    return false;
+  }
+  const bool changed = m_model.captureRawSnapshot() != m_before;
+  // Primitive edits may have filled or truncated the bounded history. Restore
+  // the complete checkpoint before adding exactly one entry for the net edit.
+  m_model.m_undo = m_undo;
+  m_model.m_redo = m_redo;
+  s_recentEdits = m_recentEdits;
+  if (changed) {
+    m_model.m_redo.clear();
+    m_model.pushRawDiffUndo(m_before);
+    for (const auto &entry : m_model.m_undo.back()) {
+      recordEdit(entry.raw, entry.offset);
+    }
+  }
+  m_model.m_ir.reset();
+  m_active = false;
+  return true;
+}
+
+bool CapcomPianoRollModel::EditTransaction::rollback(std::string *error) {
+  if (!m_active) {
+    return true;
+  }
+  if (!m_raw || m_model.m_raw != m_raw || !m_raw->isWritable() || m_raw->size() != m_before.size()) {
+    if (error) {
+      *error = "Cannot roll back transaction: backing data changed or is read-only.";
+    }
+    return false;
+  }
+  for (size_t i = 0; i < m_before.size(); ++i) {
+    if (m_raw->readByte(i) != m_before[i] && !m_raw->writeByte(i, m_before[i])) {
+      if (error) {
+        *error = "Failed to restore transaction bytes.";
+      }
+      return false;
+    }
+  }
+  m_model.m_allocationFloor = m_allocationFloor;
+  m_model.m_undo = m_undo;
+  m_model.m_redo = m_redo;
+  s_recentEdits = m_recentEdits;
+  SyncSeqTrackOffsetsFromHeader(m_model.m_seq, m_raw);
+  m_model.reload();
+  m_active = false;
   return true;
 }
 

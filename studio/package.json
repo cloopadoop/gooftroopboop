@@ -1,7 +1,7 @@
 {
   "name": "goof-troop-boop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,7 @@
     "test:tauri": "tests-tauri\\run.cmd",
     "test:all": "tests-tauri\\all.cmd",
     "test:release": "tests-tauri\\release.cmd",
+    "test:qualify": "tests-tauri\\qualify.cmd",
     "preview": "vite preview",
     "tauri": "tauri"
   },

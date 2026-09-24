@@ -71,6 +71,8 @@ const char *cmdTypeName(CapcomCmdType type) {
       return "EchoOnOff";
     case CapcomCmdType::ReleaseRate:
       return "ReleaseRate";
+    case CapcomCmdType::NoOp:
+      return "NoOp";
     case CapcomCmdType::Unknown:
       return "Unknown";
   }
@@ -134,6 +136,8 @@ bool parseCmdType(const std::string &name, CapcomCmdType *out) {
     *out = CapcomCmdType::EchoOnOff;
   } else if (typeName == "ReleaseRate") {
     *out = CapcomCmdType::ReleaseRate;
+  } else if (typeName == "NoOp") {
+    *out = CapcomCmdType::NoOp;
   } else if (typeName == "Unknown") {
     *out = CapcomCmdType::Unknown;
   } else {
@@ -258,6 +262,7 @@ bool encodeCmdBytes(const CapcomCmdIR &cmd, std::vector<uint8_t> &out, bool writ
     case CapcomCmdType::PortamentoTime:
     case CapcomCmdType::EchoOnOff:
     case CapcomCmdType::ReleaseRate:
+    case CapcomCmdType::NoOp:
       if (cmd.params.size() != 1) {
         return failParams(1);
       }
@@ -380,6 +385,8 @@ void CapcomSeqIR::initEventMap() {
   m_eventMap[0x1B] = CapcomCmdType::EchoParam;
   m_eventMap[0x1C] = CapcomCmdType::EchoOnOff;
   m_eventMap[0x1D] = CapcomCmdType::ReleaseRate;
+  m_eventMap[0x1E] = CapcomCmdType::NoOp;
+  m_eventMap[0x1F] = CapcomCmdType::NoOp;
 }
 
 bool CapcomSeqIR::toJson(nlohmann::json *out, std::string *error) const {
@@ -858,6 +865,55 @@ bool CapcomSeqIR::serializeToBuffer(RawFile *raw, std::vector<uint8_t> *out, std
     return best;
   };
   std::unordered_map<uint32_t, uint32_t> emittedByOrig;
+  using EmitRef = std::pair<int, size_t>;
+  std::array<std::vector<EmitRef>, MAX_TRACKS> emission;
+  std::unordered_set<uint32_t> scheduled;
+  std::array<std::unordered_set<uint32_t>, MAX_TRACKS> originalHomeCommands;
+  for (int ti = 0; ti < MAX_TRACKS; ++ti) {
+    if (!m_tracks[ti]) {
+      continue;
+    }
+    auto& trk = *m_tracks[ti];
+    newCmdOffsets[ti].assign(trk.cmds.size(), 0);
+    CapcomTrackTraversalResult original;
+    if (CapcomTrackTraversal::Traverse(raw, homeStart[ti], &original)) {
+      for (const auto& step : original.steps) {
+        originalHomeCommands[ti].insert(step.cmd.origAbsOffset);
+      }
+    }
+    for (size_t ci = 0; ci < trk.cmds.size(); ++ci) {
+      const auto off = trk.cmds[ci].origAbsOffset;
+      if (off == kInvalidOffset || homeTrack(off) == ti) {
+        emission[ti].emplace_back(ti, ci);
+        if (off != kInvalidOffset) {
+          scheduled.insert(off);
+        }
+      }
+    }
+  }
+  // Some shared tails are reached only by another channel: their physical
+  // home channel stops or jumps before them. Retain those commands in their
+  // original byte order at home. Do not resurrect commands deliberately
+  // deleted from a home channel that originally traversed them.
+  for (int ti = 0; ti < MAX_TRACKS; ++ti) {
+    if (!m_tracks[ti]) {
+      continue;
+    }
+    for (size_t ci = 0; ci < m_tracks[ti]->cmds.size(); ++ci) {
+      const auto off = m_tracks[ti]->cmds[ci].origAbsOffset;
+      const int owner = off == kInvalidOffset ? -1 : homeTrack(off);
+      if (owner < 0 || scheduled.count(off) || originalHomeCommands[owner].count(off)) {
+        continue;
+      }
+      auto& refs = emission[owner];
+      auto pos = std::find_if(refs.begin(), refs.end(), [&](const EmitRef& ref) {
+        const auto other = m_tracks[ref.first]->cmds[ref.second].origAbsOffset;
+        return other != kInvalidOffset && other > off;
+      });
+      refs.insert(pos, {ti, ci});
+      scheduled.insert(off);
+    }
+  }
   for (int ti = 0; ti < MAX_TRACKS; ++ti) {
     if (!m_tracks[ti]) {
       newTrackStarts[ti] = 0;
@@ -869,18 +925,13 @@ bool CapcomSeqIR::serializeToBuffer(RawFile *raw, std::vector<uint8_t> *out, std
     if (!validateU16Offset("Track start", newTrackStarts[ti])) {
       return false;
     }
-    newCmdOffsets[ti].assign(trk.cmds.size(), 0);
-
-    for (size_t ci = 0; ci < trk.cmds.size(); ++ci) {
-      const auto &cmd = trk.cmds[ci];
-      if (cmd.origAbsOffset != kInvalidOffset && homeTrack(cmd.origAbsOffset) != ti) {
-        continue;  // foreign clone: emitted by its home track, mapped later
-      }
-      newCmdOffsets[ti][ci] = m_seqBaseAbs + static_cast<uint32_t>(newData.size());
+    for (const auto& [sourceTrack, ci] : emission[ti]) {
+      const auto &cmd = m_tracks[sourceTrack]->cmds[ci];
+      newCmdOffsets[sourceTrack][ci] = m_seqBaseAbs + static_cast<uint32_t>(newData.size());
       if (cmd.origAbsOffset != kInvalidOffset) {
-        emittedByOrig.emplace(cmd.origAbsOffset, newCmdOffsets[ti][ci]);
+        emittedByOrig.emplace(cmd.origAbsOffset, newCmdOffsets[sourceTrack][ci]);
       }
-      if (!validateU16Offset("Command", newCmdOffsets[ti][ci])) {
+      if (!validateU16Offset("Command", newCmdOffsets[sourceTrack][ci])) {
         return false;
       }
 
@@ -922,12 +973,17 @@ bool CapcomSeqIR::serializeToBuffer(RawFile *raw, std::vector<uint8_t> *out, std
 
   uint32_t headerPtrBase = m_priorityInHeader ? 1 : 0;
   for (int ti = 0; ti < MAX_TRACKS; ++ti) {
+    const int owner = homeTrack(homeStart[ti]);
+    if (m_tracks[ti] && owner >= 0 && owner != ti && homeStart[owner] == homeStart[ti]) {
+      newTrackStarts[ti] = newTrackStarts[owner];
+    }
     uint16_t ptr = static_cast<uint16_t>(newTrackStarts[ti] & 0xFFFF);
     size_t pos = headerPtrBase + ti * 2;
     newData[pos] = static_cast<uint8_t>((ptr >> 8) & 0xFF);
     newData[pos + 1] = static_cast<uint8_t>(ptr & 0xFF);
   }
 
+  std::unordered_set<uint32_t> unresolvedBreaks;
   for (auto &p : patches) {
     size_t pos = p.newPtrAbsOffset - m_seqBaseAbs;
     if (pos + 1 >= newData.size()) {
@@ -954,6 +1010,15 @@ bool CapcomSeqIR::serializeToBuffer(RawFile *raw, std::vector<uint8_t> *out, std
     }
 
     if (targetTrackIndex < 0 || targetTrackIndex >= MAX_TRACKS) {
+      if (p.kind == CapcomPointerPatch::Kind::RepeatBreak) {
+        // An untaken conditional operand is not a dereferenced pointer.
+        // Preserve it provisionally, then prove it stays untaken in the
+        // complete edited control flow (not just the original traversal).
+        newData[pos] = static_cast<uint8_t>(p.origWord >> 8);
+        newData[pos + 1] = static_cast<uint8_t>(p.origWord & 0xFF);
+        unresolvedBreaks.insert(p.newPtrAbsOffset - 2);
+        continue;
+      }
       std::ostringstream oss;
       oss << "Unresolved destination for pointer patch (kind=" << static_cast<int>(p.kind)
           << "), origWord=0x" << std::hex << p.origWord;
@@ -993,6 +1058,34 @@ bool CapcomSeqIR::serializeToBuffer(RawFile *raw, std::vector<uint8_t> *out, std
     uint16_t newWord = static_cast<uint16_t>(destAbs);
     newData[pos] = static_cast<uint8_t>((newWord >> 8) & 0xFF);
     newData[pos + 1] = static_cast<uint8_t>(newWord & 0xFF);
+  }
+
+  if (!unresolvedBreaks.empty()) {
+    std::vector<uint8_t> image(m_seqBaseAbs + newData.size(), 0);
+    std::copy(newData.begin(), newData.end(), image.begin() + m_seqBaseAbs);
+    VirtFile candidate(image.data(), static_cast<uint32_t>(image.size()), "edited-sequence");
+    for (int ti = 0; ti < MAX_TRACKS; ++ti) {
+      if (!m_tracks[ti]) continue;
+      CapcomTrackTraversalResult traversal;
+      std::string validationError;
+      if (!CapcomTrackTraversal::Traverse(&candidate, newTrackStarts[ti], &traversal,
+                                           &validationError, true)) {
+        setError("Edited conditional control flow cannot be verified: " + validationError);
+        return false;
+      }
+      for (size_t si = 0; si < traversal.steps.size(); ++si) {
+        const auto& cmd = traversal.steps[si].cmd;
+        const bool inImage = cmd.origAbsOffset >= m_seqBaseAbs + headerPtrBase + 16 &&
+            cmd.origAbsOffset + cmd.sizeBytes <= image.size();
+        const bool fallsThrough = si + 1 < traversal.steps.size() &&
+            traversal.steps[si + 1].cmd.origAbsOffset == cmd.origAbsOffset + cmd.sizeBytes;
+        if (!inImage || cmd.type == CapcomCmdType::Unknown ||
+            (unresolvedBreaks.count(cmd.origAbsOffset) && !fallsThrough)) {
+          setError("Edited conditional branch has an unresolved active destination.");
+          return false;
+        }
+      }
+    }
   }
 
   return true;
@@ -1103,9 +1196,16 @@ bool CapcomSeqIR::insertProgramChange(int trackIndex, int beforeCmdIndex, uint8_
   trk.cmds.insert(trk.cmds.begin() + beforeCmdIndex, cmd);
   m_structuralChange = true;
 
-  for (auto &c : trk.cmds) {
-    if (c.destTrackIndex == trackIndex && c.destCmdIndex >= beforeCmdIndex) {
-      c.destCmdIndex++;
+  // Jumps into this track can come from any track (shared-data songs), so
+  // shift their targets everywhere, not just within this track's list.
+  for (auto &other : m_tracks) {
+    if (!other) {
+      continue;
+    }
+    for (auto &c : other->cmds) {
+      if (c.destTrackIndex == trackIndex && c.destCmdIndex >= beforeCmdIndex) {
+        c.destCmdIndex++;
+      }
     }
   }
 
@@ -1131,9 +1231,16 @@ bool CapcomSeqIR::insertCommand(int trackIndex, int beforeCmdIndex, const Capcom
   trk.cmds.insert(trk.cmds.begin() + beforeCmdIndex, cmd);
   m_structuralChange = true;
 
-  for (auto &c : trk.cmds) {
-    if (c.destTrackIndex == trackIndex && c.destCmdIndex >= beforeCmdIndex) {
-      c.destCmdIndex++;
+  // Jumps into this track can come from any track (shared-data songs), so
+  // shift their targets everywhere, not just within this track's list.
+  for (auto &other : m_tracks) {
+    if (!other) {
+      continue;
+    }
+    for (auto &c : other->cmds) {
+      if (c.destTrackIndex == trackIndex && c.destCmdIndex >= beforeCmdIndex) {
+        c.destCmdIndex++;
+      }
     }
   }
 
@@ -1190,12 +1297,17 @@ bool CapcomSeqIR::removeCommand(int trackIndex, int cmdIndex) {
   trk.cmds.erase(trk.cmds.begin() + cmdIndex);
   m_structuralChange = true;
 
-  for (auto &c : trk.cmds) {
-    if (c.destTrackIndex != trackIndex) {
+  for (auto &other : m_tracks) {
+    if (!other) {
       continue;
     }
-    if (c.destCmdIndex > cmdIndex) {
-      c.destCmdIndex--;
+    for (auto &c : other->cmds) {
+      if (c.destTrackIndex != trackIndex) {
+        continue;
+      }
+      if (c.destCmdIndex > cmdIndex) {
+        c.destCmdIndex--;
+      }
     }
   }
 

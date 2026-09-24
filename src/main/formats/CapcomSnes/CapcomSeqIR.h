@@ -39,6 +39,7 @@ enum class CapcomCmdType {
   EchoParam,
   EchoOnOff,
   ReleaseRate,
+  NoOp,
   Unknown
 };
 
